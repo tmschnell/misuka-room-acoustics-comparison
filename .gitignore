@@ -1,0 +1,23 @@
+# Generated comparison results (regenerate via pra_comparison_runner.py) --
+# many of these .npz arrays are hundreds of MB, well over GitHub's 100MB
+# per-file limit.
+pra_comparison_data/
+
+# Third-party BRAS benchmark geometry (Brinkmann/Aspoeck et al. 2021,
+# CR4 large room) -- not redistributed here, licensing/attribution for
+# this dataset hasn't been confirmed. Fetch it from the original benchmark
+# release and place it under these paths to reproduce the auditorium
+# scenarios locally.
+pra_comparison_assets/bras_cr4/
+pra_comparison_assets/bras_cr4_v2/
+
+# Old pre-restructure snapshot, superseded.
+*.bak_prerestructure
+
+# Python / Jupyter / OS
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+.claude/
