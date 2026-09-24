@@ -248,7 +248,15 @@ def misuka_lroom_shapes(a, b, c, d, height, bsdf):
 
 
 def misuka_scene_dict(shapes, source_pos, mic_pos, source_radius,
-                       max_time, frequencies=FREQUENCY_HZ):
+                       max_time, frequencies=FREQUENCY_HZ, sampling_rate=None):
+    """sampling_rate defaults to the module-level SAMPLING_RATE (every
+    existing caller's behaviour, unchanged) -- exposed as a parameter for
+    the bin-width-dependence sweep in analyze_post_vs_inline_attenuation.py,
+    which needs a scene at a *different* time-bin resolution without
+    touching the global every other scenario/comparison relies on.
+    """
+    if sampling_rate is None:
+        sampling_rate = SAMPLING_RATE
     freqs = frequencies if isinstance(frequencies, str) else str(frequencies)
     scene_dict = dict(shapes)
     scene_dict["type"] = "scene"
@@ -265,14 +273,14 @@ def misuka_scene_dict(shapes, source_pos, mic_pos, source_radius,
         "film": {
             "type": "tape",
             "frequencies": freqs,
-            "time_bins": int(round(max_time * SAMPLING_RATE)),
+            "time_bins": int(round(max_time * sampling_rate)),
         },
     }
     return scene_dict
 
 
 def render_misuka(scene, max_time, max_energy_loss=80.0, spp=MISUKA_SPP, seed=0, sensor=None,
-                   atmosphere=False, apply_attenuation=True):
+                   atmosphere=False, apply_attenuation=True, speed_of_sound=None):
     # 80 dB matches PRA_ENERGY_THRES above (10**(-80/10) = 1e-8): otherwise
     # misuka's paths would be cut off earlier or later than PRA's rays,
     # producing an artificial cliff to zero in the tail that has nothing to
@@ -313,7 +321,12 @@ def render_misuka(scene, max_time, max_energy_loss=80.0, spp=MISUKA_SPP, seed=0,
             "apply_attenuation": apply_attenuation,
         }
     else:
-        integrator_dict["speed_of_sound"] = SPEED_OF_SOUND
+        # speed_of_sound=None (the default) keeps every existing call site's
+        # behavior unchanged; an explicit override is used by scenarios that
+        # need to match a specific external reference value (e.g. Richter's
+        # Gewandhaus reproduction at c=343.64 m/s) without touching the
+        # shared SPEED_OF_SOUND constant every other scenario relies on.
+        integrator_dict["speed_of_sound"] = speed_of_sound if speed_of_sound is not None else SPEED_OF_SOUND
     integrator = mi.load_dict(integrator_dict)
     kwargs = {"sensor": sensor} if sensor is not None else {}
     etc = integrator.render(scene, seed=seed, spp=spp, **kwargs)
@@ -977,6 +990,48 @@ def scenario_auditorium_complex():
     )
 
 
+# Gewandhaus (GRAP database RNo01): a second real-geometry scenario, chosen
+# for being much smaller than the auditorium (296 triangles vs. ~5100) --
+# small enough that pyroomacoustics' ISM stays fast even at the "hybrid"
+# order (see pra_comparison_gewandhaus.py's own docstring for the verified
+# timings and the two explicitly-agreed simplifications: the existing
+# 3-material grouping reused as-is, and a freshly chosen source/mic pair
+# rather than GRAP's own unverifiable R1 coordinates).
+GEWANDHAUS_MAX_TIME = 4.0
+# PRA's own reference ray count: Richter's Nr (last_peak=0.2315s reference,
+# see necessary_rays()) is ~2.59M; rounded up for margin. Far below the
+# ~773M a full max_time-based necessary_rays would call for -- that many
+# PRA rays is not tractable (measured: ~245s per 1e6 rays here), so the PRA
+# side stays fixed at this one, already-justified count across every
+# spp value in misuka's own sweep below.
+GEWANDHAUS_PRA_N_RAYS = 3_000_000
+# misuka's own sweep: the 50-repeat run (2026-09-16/17) showed all six
+# parameters flat by spp=65,536-524,288 already -- the sweep originally went
+# to 2**27 "to be safe", but a log2-spaced sweep pays for every rung, not
+# just the top one (measured: the full 2**10..2**27 sweep costs ~811s/repeat
+# despite the top rung alone being cheap -- this, not PRA, was the main
+# reason the run took ~29h against a ~10h estimate that priced PRA only).
+# Capped here at 2**23 (~16x margin over the observed flattening point),
+# cutting the sweep to ~51s/repeat with no loss of the converged value.
+GEWANDHAUS_SPP_VALUES = [2 ** k for k in range(10, 24)]  # 1,024 .. 8,388,608
+
+
+def scenario_gewandhaus():
+    import pra_comparison_gewandhaus as gw
+    max_time = GEWANDHAUS_MAX_TIME
+    scene_dict = gw.build_misuka_scene_dict(max_time, SAMPLING_RATE, frequencies=str(FREQUENCY_HZ))
+    return dict(
+        name="gewandhaus",
+        max_time=max_time,
+        misuka_scene=scene_dict,
+        pra_room_factory=lambda order, **kw: gw.build_pra_room(
+            order, fs=int(BIN_FACTOR * SAMPLING_RATE), hist_bin_size=1.0 / SAMPLING_RATE,
+            n_rays=GEWANDHAUS_PRA_N_RAYS, energy_thres=PRA_ENERGY_THRES, time_thres=max_time, **kw),
+        spp_values=GEWANDHAUS_SPP_VALUES,
+        period_s=None,
+    )
+
+
 def scenario_direct_sound_only():
     """Free-field/direct-sound-only stand-in for test_direct_sound_geometric_
     alignment below (error source (1), see the alignment section above): a
@@ -1192,8 +1247,15 @@ def compare_atmosphere(scenario, seed=0):
     # rendered (at the fixed SPEED_OF_SOUND, not the atmosphere-derived
     # one) -- this is purely a timing comparison, not a repeat of the
     # accuracy comparison already covered in atmospheric_rendering.ipynb.
+    # This module's own apply_pure_tone_attenuation(), not misuka's: the
+    # latter was removed from acoustic.h and mi.acoustic no longer exposes
+    # it (calling it here raised AttributeError, which also broke
+    # run_atmosphere). The local reimplementation performs the same
+    # computation -- per-bin distance times the ISO 9613-1 coefficient from
+    # the still-public energy_attenuation_coefficient() -- so it remains a
+    # fair stand-in for the post-processing approach's cost.
     t0 = time.perf_counter()
-    mi.acoustic.apply_pure_tone_attenuation(
+    apply_pure_tone_attenuation(
         e_no_atmo, sampling_rate=SAMPLING_RATE, speed_of_sound_ms=SPEED_OF_SOUND,
         temperature=ATMO_TEMPERATURE, frequencies=[FREQUENCY_HZ],
         relative_humidity=ATMO_RELATIVE_HUMIDITY, atmospheric_pressure=ATMO_PRESSURE)
@@ -1927,6 +1989,13 @@ def test_air_absorption_vs_pyroomacoustics_table(variant_scalar_acoustic, temper
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
+    plt.rc('font', family='cmr10', size=11)
+    plt.rc('mathtext', fontset='cm')
+    plt.rc('axes', unicode_minus=False)  # cmr10 has no unicode minus glyph
+    plt.rc('savefig', format='svg')
+    MISUKA_COLOR, MISUKA_COLOR_ALT = "#2ca02c", "#1b7837"
+    PRA_COLOR, PRA_COLOR_ALT = "#ff7f0e", "#fdae61"
+
     mi.set_variant("cuda_acoustic", "llvm_ad_acoustic")
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -1945,15 +2014,15 @@ if __name__ == "__main__":
             with np.errstate(divide="ignore"):
                 axes[0].plot(t, 10 * np.log10(e_misuka / e_misuka.max() + 1e-12),
                             label="misuka" if pra_order == 0 else None,
-                            color="C0", linestyle="-" if pra_order == 0 else "--")
+                            color=MISUKA_COLOR, linestyle="-" if pra_order == 0 else "--")
                 axes[0].plot(t, 10 * np.log10(e_pra / e_pra.max() + 1e-12),
                             label=f"pra ({mode_name})",
-                            color="C1" if pra_order == 0 else "C2")
+                            color=PRA_COLOR if pra_order == 0 else PRA_COLOR_ALT)
             axes[1].plot(t[:len(e_misuka)], schroeder_edc_db(e_misuka),
-                        color="C0", linestyle="-" if pra_order == 0 else "--",
+                        color=MISUKA_COLOR, linestyle="-" if pra_order == 0 else "--",
                         label="misuka" if pra_order == 0 else None)
             axes[1].plot(t[:len(e_pra)], schroeder_edc_db(e_pra),
-                        color="C1" if pra_order == 0 else "C2",
+                        color=PRA_COLOR if pra_order == 0 else PRA_COLOR_ALT,
                         label=f"pra ({mode_name})")
 
         axes[0].set_title("Energy time curve (dB)")
@@ -1963,10 +2032,10 @@ if __name__ == "__main__":
         axes[1].set_xlabel("Time [s]")
         axes[1].legend()
 
-        out_png = os.path.join(RESULTS_DIR, f"{scenario['name']}.png")
+        out_svg = os.path.join(RESULTS_DIR, f"{scenario['name']}.svg")
         fig.tight_layout()
-        fig.savefig(out_png, dpi=150)
-        print(f"-> saved {out_png}\n")
+        fig.savefig(out_svg)
+        print(f"-> saved {out_svg}\n")
 
     # --- misuka atmospheric rendering: no-atmosphere vs. inline, +runtime ---
     for scenario_fn in SCENARIOS:
@@ -1982,13 +2051,13 @@ if __name__ == "__main__":
         t = np.arange(len(e_no_atmo)) * dt
         with np.errstate(divide="ignore"):
             axes[0].plot(t, 10 * np.log10(e_no_atmo / e_no_atmo.max() + 1e-12),
-                        color="C0", label="no atmosphere")
+                        color=MISUKA_COLOR, label="no atmosphere")
             axes[0].plot(t, 10 * np.log10(e_atmo / e_atmo.max() + 1e-12),
-                        color="C3", label="inline atmosphere")
+                        color=MISUKA_COLOR_ALT, label="inline atmosphere")
         axes[1].plot(t[:len(e_no_atmo)], schroeder_edc_db(e_no_atmo),
-                    color="C0", label="no atmosphere")
+                    color=MISUKA_COLOR, label="no atmosphere")
         axes[1].plot(t[:len(e_atmo)], schroeder_edc_db(e_atmo),
-                    color="C3", label="inline atmosphere")
+                    color=MISUKA_COLOR_ALT, label="inline atmosphere")
 
         axes[0].set_title("Energy time curve (dB)")
         axes[0].set_xlabel("Time [s]")
@@ -1997,9 +2066,9 @@ if __name__ == "__main__":
         axes[1].set_xlabel("Time [s]")
         axes[1].legend()
 
-        out_png = os.path.join(RESULTS_DIR, f"{scenario['name']}_atmosphere.png")
+        out_svg = os.path.join(RESULTS_DIR, f"{scenario['name']}_atmosphere.svg")
         fig.tight_layout()
-        fig.savefig(out_png, dpi=150)
-        print(f"-> saved {out_png}\n")
+        fig.savefig(out_svg)
+        print(f"-> saved {out_svg}\n")
 
     plt.show()

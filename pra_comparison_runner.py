@@ -498,8 +498,13 @@ def run_appendix_hybrid_params(n_repeats=N_REPEATS):
         n_time_bins = int(round(scenario["max_time"] * cmp.SAMPLING_RATE))
         param_keys = list(JND_ABS) + list(JND_REL)
         check_alignment_offset_negligible(source_radius, scenario_name=scenario["name"])
+        # per-scenario override -- e.g. scenario_gewandhaus's own, much
+        # higher-reaching sweep (misuka is cheap there even well past its
+        # necessary_rays; see that scenario's own module docstring) instead
+        # of the shoebox-scale default.
+        spp_values = scenario.get("spp_values", SPP_VALUES)
 
-        def render_one(seed, scenario=scenario):
+        def render_one(seed, scenario=scenario, spp_values=spp_values):
             # PRA's hybrid room uses ray_tracing=True (see pra_box_room/
             # pra_lroom_room) -- rebuilding + re-computing it per repeat is
             # what makes this reference vary across repeats too.
@@ -521,7 +526,7 @@ def run_appendix_hybrid_params(n_repeats=N_REPEATS):
 
             out = {f"reference_{p}": reference_params[p] for p in param_keys}
             per_param_series = {p: [] for p in param_keys}
-            for n_rays in SPP_VALUES:
+            for n_rays in spp_values:
                 etc = cmp.render_misuka(scenario["misuka_scene"], scenario["max_time"], spp=n_rays, seed=seed)
                 etc_aligned = cmp.align_hull_to_center_lossless(etc, source_radius, cmp.SAMPLING_RATE)
                 params = parameters_full(etc_aligned, distance0, source_radius, g_radius_term=2 * source_radius)
@@ -533,8 +538,8 @@ def run_appendix_hybrid_params(n_repeats=N_REPEATS):
 
         per_repeat, mean, std = _repeat_and_aggregate(render_one, n_repeats)
         arrays, result_metrics = _repeated_arrays_and_metrics(per_repeat, mean, std)
-        arrays["spp"] = np.array(SPP_VALUES)
-        result_metrics["n_max"] = SPP_VALUES[-1]
+        arrays["spp"] = np.array(spp_values)
+        result_metrics["n_max"] = spp_values[-1]
         for p in param_keys:
             # misuka_{p} is per-spp (array-valued, so its mean/std only ever
             # land in `arrays`, not `metrics` -- see
@@ -571,11 +576,11 @@ def run_appendix_hybrid_params(n_repeats=N_REPEATS):
             "appendix_hybrid_params", scenario["name"],
             metrics=result_metrics, arrays=arrays,
             room=_room_metadata(scenario, scenario["pra_room_factory"](cmp.RT_HYBRID_ORDER)),
-            render_params=_repeat_render_params(n_repeats, spp_values=SPP_VALUES,
+            render_params=_repeat_render_params(n_repeats, spp_values=spp_values,
                                                 pra_order=cmp.RT_HYBRID_ORDER, pra_mode="hybrid"),
             extra=extra,
         )
-        print(f"done: {scenario['name']:24s} (Hybrid parameter-level, n_max={SPP_VALUES[-1]}, "
+        print(f"done: {scenario['name']:24s} (Hybrid parameter-level, n_max={spp_values[-1]}, "
               f"{n_repeats} repeat(s))")
 
 
@@ -623,6 +628,75 @@ def run_appendix_rt_histogram(n_repeats=N_REPEATS):
             render_params=_repeat_render_params(n_repeats, misuka_spp=SPP_VALUES[-1],
                                                 pra_order=rt_only_order, pra_mode="rt_only"),
         )
+
+
+# =====================================================================
+#   Richter Fig.14 reproduction: misuka (ours) vs. misuka (Richter's own
+#   Masterarbeit results for Gewandhaus) -- NOT misuka-vs-PRA, so this is
+#   deliberately not part of PRA_SCENARIOS/run_all/run_edc_runtime_and_
+#   appendix (same exclusion pattern as CR4/scenario_gewandhaus). See
+#   pra_comparison_gewandhaus.py's RICHTER_* constants for the full
+#   derivation of every setting used here (source_radius, f=20Hz, c,
+#   position, floor-split materials) and their remaining, documented
+#   limitations (no real R1 coordinate, TS stays open).
+# =====================================================================
+
+def run_richter_gewandhaus_reproduction(n_repeats=50):
+    import pra_comparison_gewandhaus as gw
+
+    max_time = 4.0
+    spp = 8_388_608  # already-converged value, see the conversation's own timing/convergence checks
+    scene_dict = gw.build_misuka_scene_dict_richter(max_time, cmp.SAMPLING_RATE)
+    distance0 = float(np.linalg.norm(np.array(gw.RICHTER_SOURCE_POS) - np.array(gw.RICHTER_MIC_POS)))
+    param_keys = ["G", "EDT", "TS", "C50", "T60", "C80"]
+
+    def render_one(seed):
+        etc = cmp.render_misuka(scene_dict, max_time, spp=spp, seed=seed,
+                                speed_of_sound=gw.RICHTER_SPEED_OF_SOUND)
+        etc_aligned = cmp.align_hull_to_center_lossless(etc, gw.RICHTER_SOURCE_RADIUS, cmp.SAMPLING_RATE,
+                                                        speed_of_sound=gw.RICHTER_SPEED_OF_SOUND)
+        params = parameters_full(etc_aligned, distance0, gw.RICHTER_SOURCE_RADIUS,
+                                 sampling_rate=cmp.SAMPLING_RATE, speed_of_sound=gw.RICHTER_SPEED_OF_SOUND,
+                                 g_radius_term=2 * gw.RICHTER_SOURCE_RADIUS)
+        return {p: params[p] for p in param_keys}
+
+    per_repeat, mean, std = _repeat_and_aggregate(render_one, n_repeats)
+    arrays, result_metrics = _repeated_arrays_and_metrics(per_repeat, mean, std)
+    for p in param_keys:
+        ref = gw.RICHTER_FIG14_REFERENCE[p]
+        jnd = gw.RICHTER_FIG14_JND[p] if p in gw.RICHTER_FIG14_JND else 0.156 * abs(ref)
+        result_metrics[f"{p}_fig14_ref"] = ref
+        result_metrics[f"{p}_fig14_jnd"] = jnd
+        result_metrics[f"{p}_fig14_diff"] = float(arrays[f"{p}_mean"] - ref)
+
+    storage.save_run(
+        "richter_gewandhaus_reproduction", "gewandhaus",
+        metrics=result_metrics, arrays=arrays,
+        room=dict(max_time=max_time, source_pos=list(gw.RICHTER_SOURCE_POS),
+                 source_radius=gw.RICHTER_SOURCE_RADIUS, mic_pos=list(gw.RICHTER_MIC_POS),
+                 visibility_quota="26/43 (60.5%), see conversation for the candidate grid search"),
+        render_params=_repeat_render_params(n_repeats, misuka_spp=spp,
+                                            speed_of_sound=gw.RICHTER_SPEED_OF_SOUND,
+                                            frequency_hz=gw.RICHTER_FREQUENCY_HZ),
+        extra=dict(
+            comparison_target="Richter Masterarbeit Fig.14 (p.33), reference/hybrid line, read off by eye",
+            limitations=(
+                "Source/mic position is NOT GRAP's real R1 (unrecoverable from any "
+                "available source -- see pra_comparison_gewandhaus.py docstring); chosen "
+                "instead by documented line-of-sight visibility quota. Materials use a "
+                "targeted floor/wall split (10 of 212 'walls' triangles), not the full "
+                "6 original GRAP material groups. TS remains outside JND and moves "
+                "further from the reference under every absorption change tested -- an "
+                "independent, unresolved discrepancy, not a sign either fix is wrong."
+            ),
+        ),
+    )
+    print(f"done: richter_gewandhaus_reproduction (n_repeats={n_repeats}, spp={spp})")
+    for p in param_keys:
+        diff = result_metrics[f"{p}_fig14_diff"]
+        jnd = result_metrics[f"{p}_fig14_jnd"]
+        status = "OK" if abs(diff) <= jnd else "outside JND"
+        print(f"  {p:5s} diff={diff:8.4f}  JND={jnd:6.3f}  [{status}]")
 
 
 # =====================================================================
