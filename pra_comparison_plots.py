@@ -23,8 +23,15 @@ from matplotlib.colors import LinearSegmentedColormap
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import pyfar as pf
 
+
+from matplotlib.patches import Rectangle
+from matplotlib.markers import MarkerStyle
+from matplotlib.path import Path
+import matplotlib.transforms as mtransforms
+from colorspacious import cspace_convert
+
 import test_pyroomacoustics_comparison as cmp
-from pra_comparison_metrics import pyrato_edc, JND_ABS, JND_REL
+from pra_comparison_metrics import pyrato_edc, JND_ABS, JND_REL, jnd_band
 
 # Suite-wide plot style: cmr10 (LaTeX's default serif) + vector (SVG) output
 # for every fig.savefig() call, so figures drop straight into a LaTeX report
@@ -41,8 +48,150 @@ plt.rc('savefig', format='svg')
 MISUKA_COLOR = "#2ca02c"
 MISUKA_COLOR_ALT = "#1b7837"
 MISUKA_COLOR_ALT2 = "#78c679"
+MISUKA_COLOR_ALT3 = "#0c3017"
 PRA_COLOR = "#ff7f0e"
 PRA_COLOR_ALT = "#fdae61"
+
+
+def hex_to_rgb(color):
+
+    color = color.lstrip("#")
+
+    return np.array([
+
+        int(color[i:i+2], 16) / 255
+
+        for i in (0, 2, 4)
+
+    ])
+
+def rgb_to_hex(rgb):
+
+    rgb = np.clip(rgb, 0, 1)
+
+    rgb = (rgb * 255).round().astype(int)
+
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+# ---------------------------------------------------------------------
+
+# 1. Original colors
+
+# ---------------------------------------------------------------------
+
+colors = [
+
+    MISUKA_COLOR_ALT3,
+
+    MISUKA_COLOR_ALT,
+
+    MISUKA_COLOR,
+
+    MISUKA_COLOR_ALT2,
+
+    PRA_COLOR,
+
+    PRA_COLOR_ALT,
+
+]
+
+rgb = np.array([hex_to_rgb(c) for c in colors])
+
+# RGB -> CIELAB
+
+lab = cspace_convert(rgb, "sRGB1", "CIELab")
+
+# ---------------------------------------------------------------------
+
+# 2. Define where the colors should occur
+
+# ---------------------------------------------------------------------
+
+
+positions = np.array([
+
+    0.00,
+
+    0.1,
+
+    0.25,
+
+    0.55,
+
+    0.7,
+
+    1.00,
+
+])
+
+# ---------------------------------------------------------------------
+
+# 3. Interpolate in CIELAB
+
+# ---------------------------------------------------------------------
+
+n = 256
+
+x = np.linspace(0, 1, n)
+
+lab_interp = np.empty((n, 3))
+
+for channel in range(3):
+
+    lab_interp[:, channel] = np.interp(
+
+        x,
+
+        positions,
+
+        lab[:, channel]
+
+    )
+
+# ---------------------------------------------------------------------
+
+# 4. Convert back to RGB
+
+# ---------------------------------------------------------------------
+
+rgb_interp = cspace_convert(
+
+    lab_interp,
+
+    "CIELab",
+
+    "sRGB1"
+
+)
+
+rgb_interp = np.clip(rgb_interp, 0, 1)
+
+# ---------------------------------------------------------------------
+
+# 5. Create colormap
+
+# ---------------------------------------------------------------------
+
+CMAP_CHAT2 = LinearSegmentedColormap.from_list(
+
+    "pra_misuka",
+
+    rgb_interp
+
+)
+
+# Sequential map for magnitudes: JND blue (pale) -> misuka greens -> PRA
+# oranges, interpolated in CIELAB at equal spacing so no hue change is abrupt.
+_BGO_STOPS = ["#dde9f3", "#9ecae1", 
+              MISUKA_COLOR_ALT2, 
+              #MISUKA_COLOR, 
+              "#b8b04a", PRA_COLOR_ALT, PRA_COLOR]
+_bgo_lab = cspace_convert(np.array([hex_to_rgb(c) for c in _BGO_STOPS]), "sRGB1", "CIELab")
+_bgo_x = np.linspace(0, 1, len(_BGO_STOPS))
+_bgo_t = np.linspace(0, 1, 256)
+_bgo = np.clip(cspace_convert(np.stack([np.interp(_bgo_t, _bgo_x, _bgo_lab[:, c]) for c in range(3)], axis=1),
+                              "CIELab", "sRGB1"), 0, 1)
+BLUE_GREEN_ORANGE_CMAP = LinearSegmentedColormap.from_list("jnd_misuka_pra", _bgo)
 
 # Sequential map in the suite's own two colours, for the heat maps: PRA
 # orange at the low end, misuka green at the high end. Not perceptually
@@ -50,6 +199,9 @@ PRA_COLOR_ALT = "#fdae61"
 # it is offered as an alternative rather than as the default.
 PRA_TO_MISUKA_CMAP = LinearSegmentedColormap.from_list(
     "pra_to_misuka", [PRA_COLOR, MISUKA_COLOR])
+
+MISUKA_TO_PRA = LinearSegmentedColormap.from_list(
+    "misuka_to_prd", [MISUKA_COLOR_ALT3, MISUKA_COLOR, MISUKA_COLOR_ALT2])
 
 # Three-point version of the same idea, via a light midtone. Interpolating
 # orange straight to green passes through a dark olive whose lightness
@@ -250,9 +402,9 @@ def _plot_3d_room(ax, outline, height, src, mic, aspect=None):
     _plot_3d_guides(ax, src)
     _plot_3d_guides(ax, mic)
 
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_zlabel("z [m]")
+    ax.set_xlabel("x in m")
+    ax.set_ylabel("y in m")
+    ax.set_zlabel("z in m")
 
     if aspect is not None:
         ax.set_box_aspect(aspect)
@@ -284,13 +436,19 @@ def plot_rendered_geometries(scenarios=None):
     source/receiver marked. `scenarios` defaults to GEOMETRY_SCENARIOS (every
     scenario with a simple-enough shape for a 2D outline -- excludes
     auditorium_complex, a real mesh); pass a subset of GEOMETRY_SCENARIOS to
-    show fewer. Draws and shows each figure directly (unlike the other
-    plot_* functions above, which return a figure for the caller to show) --
-    there's no per-scenario result to hand back, only the illustration.
+    show fewer.
+
+    Returns ``{scenario_name: fig}`` for the caller to show/save, matching
+    every other plot_* function's contract (this one used to draw and
+    plt.show() each figure itself, the sole exception, since there was no
+    single scenario name to key a return value on for a multi-scenario
+    call -- a dict resolves that without giving up the "caller decides what
+    happens to the figure" contract the rest of this module relies on).
     """
     if scenarios is None:
         scenarios = GEOMETRY_SCENARIOS
 
+    figures = {}
     for scenario in scenarios:
         src, mic = scenario["src"], scenario["mic"]
 
@@ -304,13 +462,14 @@ def plot_rendered_geometries(scenarios=None):
         ax_side.set_title("Side view (X-Z)")
         ax_3d.set_title("3D view")
 
-        _plot_room_view(ax_top, scenario["top_outline"], (src[0], src[1]), (mic[0], mic[1]), "x [m]", "y [m]")
-        _plot_room_view(ax_side, scenario["side_outline"], (src[0], src[2]), (mic[0], mic[2]), "x [m]", "z [m]",
+        _plot_room_view(ax_top, scenario["top_outline"], (src[0], src[1]), (mic[0], mic[1]), "x in m", "y in m")
+        _plot_room_view(ax_side, scenario["side_outline"], (src[0], src[2]), (mic[0], mic[2]), "x in m", "z in m",
                        grayline=scenario.get("grayline"))
         _plot_3d_room(ax_3d, scenario["top_outline"], scenario["height"], src, mic, aspect=scenario.get("aspect"))
 
         fig.tight_layout()
-        plt.show()
+        figures[scenario["name"]] = fig
+    return figures
 
 
 # =====================================================================
@@ -349,8 +508,8 @@ def plot_air_absorption_comparison(conditions=None):
         ax.loglog(freqs, misuka_coeffs, "o-", color=MISUKA_COLOR, label="misuka (ISO 9613-1)")
         ax.loglog(freqs, pra_coeffs, "x--", color=PRA_COLOR, label="pra (literature table)")
         ax.set_title(f"T={temperature:.0f}°C  RH={humidity:.0f}%")
-        ax.set_xlabel("Frequency [Hz]")
-        ax.set_ylabel("Attenuation coefficient [1/m]")
+        ax.set_xlabel("Frequency in Hz")
+        ax.set_ylabel("Attenuation coefficient in 1/m")
         ax.legend(fontsize=8)
         ax.grid(True, which="both", alpha=0.3)
 
@@ -431,11 +590,11 @@ def plot_main_comparison(scenario_name, runs_by_mode):
                      label=pra_label, **pra_style[mode_name])
 
     axes[0].set_title("Energy time curve (normalized, dB)")
-    axes[0].set_xlabel("Time [s]")
+    axes[0].set_xlabel("Time in s")
     axes[0].set_ylim(bottom=-105)
     axes[0].legend(fontsize=8)
     axes[1].set_title("Schroeder EDC (pyrato, dB)")
-    axes[1].set_xlabel("Time [s]")
+    axes[1].set_xlabel("Time in s")
     axes[1].legend(fontsize=8)
     fig.tight_layout()
     return fig
@@ -499,11 +658,11 @@ def plot_atmosphere(scenario_name, run):
     pf.plot.time(edc_a, dB=True, log_prefix=10, ax=axes[1], color=MISUKA_COLOR_ALT, label="inline atmosphere")
 
     axes[0].set_title("Energy time curve (normalized, dB)")
-    axes[0].set_xlabel("Time [s]")
+    axes[0].set_xlabel("Time in s")
     axes[0].set_ylim(bottom=-105)
     axes[0].legend()
     axes[1].set_title("Schroeder EDC (pyrato, dB)")
-    axes[1].set_xlabel("Time [s]")
+    axes[1].set_xlabel("Time in s")
     axes[1].legend()
     fig.tight_layout()
     return fig
@@ -546,14 +705,14 @@ def plot_atmosphere_runtime_summary(records):
                         linestyle="none",elinewidth=0.5,capthick=0.5, zorder=3)
     ax_bar.set_xticks(x)
     ax_bar.set_xticklabels(results_atmo["scenario"], rotation=30, ha="right")
-    ax_bar.set_ylabel("Render time [ms]")
+    ax_bar.set_ylabel("Render time in ms")
     ax_bar.set_title("misuka render time: no atmosphere vs. inline vs. post-processed atmosphere")
     ax_bar.legend(fontsize=8)
 
     table_cols = ["scenario", "runtime_no_atmo_ms", "runtime_atmo_ms", "runtime_overhead_pct",
                  "runtime_post_total_ms", "runtime_post_overhead_pct"]
-    col_labels = ["scenario", "no atmo\n[ms]", "inline\n[ms]", "inline\noverhead [%]",
-                 "post-total\n[ms]", "post\noverhead [%]"]
+    col_labels = ["scenario", "no atmo\nin ms", "inline\nin ms", "inline\noverhead in %",
+                 "post-total\nin ms", "post\noverhead in %"]
     table_values = results_atmo[table_cols].round(2).values
     ax_table.axis("off")
     tbl = ax_table.table(cellText=table_values, colLabels=col_labels, loc="center", cellLoc="center")
@@ -611,8 +770,8 @@ def plot_atmosphere_methods(scenario_name, run):
     axes[1].set_title("Post-processing vs. inline attenuation\n(same speed of sound)")
 
     for ax in axes[:2]:
-        ax.set_xlabel("Time [s]")
-        ax.set_ylabel("Relative difference [%]")
+        ax.set_xlabel("Time in s")
+        ax.set_ylabel("Relative difference in %")
         ax.set_xlim(0, t[-1])
 
     if has_freq_data:
@@ -623,8 +782,8 @@ def plot_atmosphere_methods(scenario_name, run):
             plot_with_std_band(t, diff_pct_abs_mean[:, i], diff_pct_abs_std[:, i], ax=axes[2],
                                color=f"C{i}", a=0.5, label=f"{f:.0f} Hz")
         axes[2].set_title("Post-processing vs. inline attenuation\nrelative error (|%|), per frequency")
-        axes[2].set_xlabel("Time [s]")
-        axes[2].set_ylabel("Relative difference [%] (abs)")
+        axes[2].set_xlabel("Time in s")
+        axes[2].set_ylabel("Relative difference in % (abs)")
         axes[2].set_xlim(0, t[-1])
         axes[2].legend(fontsize=7, ncol=2)
 
@@ -672,14 +831,14 @@ def plot_ray_count_convergence_error(scenario_name, run):
     axes[0].semilogx(spp, err_no_atmo, "o-", color=MISUKA_COLOR, label="no atmosphere")
     axes[0].semilogx(spp, err_atmo, "o-", color=MISUKA_COLOR_ALT, label="inline atmosphere")
     axes[0].set_xlabel("misuka spp (rays per frequency bin)")
-    axes[0].set_ylabel("RMS EDC error vs. PRA hybrid [dB]")
+    axes[0].set_ylabel("RMS EDC error vs. PRA hybrid in dB")
     axes[0].set_title("Absolute error")
     axes[0].legend()
     axes[0].grid(True, which="both", alpha=0.3)
 
     axes[1].semilogx(spp, delta, "o-", color=MISUKA_COLOR_ALT2)
     axes[1].set_xlabel("misuka spp (rays per frequency bin)")
-    axes[1].set_ylabel("extra error from atmosphere [dB]\n(inline atmosphere - no atmosphere)")
+    axes[1].set_ylabel("extra error from atmosphere in dB\n(inline atmosphere - no atmosphere)")
     axes[1].set_title("Atmosphere's own contribution")
     axes[1].grid(True, which="both", alpha=0.3)
 
@@ -697,7 +856,7 @@ def plot_ray_count_convergence_relative_error(scenario_name, run):
     ax.semilogx(spp, rel_err_no_atmo_pct, "o-", color=MISUKA_COLOR, label="no atmosphere")
     ax.semilogx(spp, rel_err_atmo_pct, "o-", color=MISUKA_COLOR_ALT, label="inline atmosphere")
     ax.set_xlabel("misuka spp (rays per frequency bin)")
-    ax.set_ylabel("relative RMS EDC error vs. PRA hybrid [%]")
+    ax.set_ylabel("relative RMS EDC error vs. PRA hybrid in %")
     ax.set_title("Relative RMS error (100 * (10**(dB/10) - 1))")
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
@@ -726,7 +885,7 @@ def iso_convergence_table(run):
 def plot_iso_convergence(scenario_name, run):
     spp = run["arrays"]["spp"]
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-    fig.suptitle(f"{scenario_name} -- ISO 3382 descriptors vs. PRA hybrid, relative [%]")
+    fig.suptitle(f"{scenario_name} -- ISO 3382 descriptors vs. PRA hybrid, relative in %")
 
     metric_colors = {"T20": "C0", "T30": "C1", "C50": "C2", "D50": "C3"}
     for key, color in metric_colors.items():
@@ -737,7 +896,7 @@ def plot_iso_convergence(scenario_name, run):
     axes[1].set_title("inline atmosphere")
     for ax in axes:
         ax.set_xlabel("misuka spp (rays per frequency bin)")
-        ax.set_ylabel("relative to PRA hybrid [%]")
+        ax.set_ylabel("relative to PRA hybrid in %")
         ax.axhline(0, color="gray", linewidth=0.8, linestyle=":")
         ax.legend(fontsize=8)
         ax.grid(True, which="both", alpha=0.3)
@@ -781,9 +940,9 @@ def plot_ism_peak_convergence_metrics(scenario_name, run):
     axs[0].semilogx(spp, run["arrays"]["cosine_similarity"], "o-", color=MISUKA_COLOR)
     axs[0].set_ylabel("Cosine similarity")
     axs[1].semilogx(spp, run["arrays"]["rmspe_pct"], "o-", color=MISUKA_COLOR)
-    axs[1].set_ylabel("RMSPE [%]")
+    axs[1].set_ylabel("RMSPE in %")
     axs[2].semilogx(spp, run["arrays"]["mpe_pct"], "o-", color=MISUKA_COLOR)
-    axs[2].set_ylabel("MPE [%]")
+    axs[2].set_ylabel("MPE in %")
     axs[2].set_xlabel("misuka spp (rays per frequency bin)")
     for ax in axs:
         ax.grid(True, which="both", alpha=0.3)
@@ -795,44 +954,121 @@ def plot_ism_peak_convergence_metrics(scenario_name, run):
 #           Appendix 2: Hybrid parameter level
 # =====================================================================
 
-def plot_hybrid_jnd(scenario_name, run):
+def _three_ticks(axis, lo, hi):
+    """Exactly three ticks at round values within [lo, hi]: steps of 1, 2 or
+    5 x 10^k first, then 2.5, then 1.5, 3 or 4 x 10^k; falls back to
+    matplotlib's choice if none fits."""
+    decades = range(int(np.floor(np.log10(hi - lo))) - 2, int(np.ceil(np.log10(hi - lo))) + 1)
+    for mantissas in ((1, 2, 5), (2.5,), (1.5, 3, 4)):
+        for e in decades:
+            for m in mantissas:
+                step = m * 10.0 ** e
+                ticks = np.arange(np.ceil(lo / step) * step, hi + 1e-9 * step, step)
+                if len(ticks) == 3:
+                    axis.set_major_locator(mticker.FixedLocator(ticks))
+                    return
+    axis.set_major_locator(mticker.MaxNLocator(3))
+
+
+def plot_hybrid_jnd(scenario_name, run, external_reference=None, external_label="external reference",
+                    params=None, pra_fixed=None, pra_fixed_per_repeat=None, reference_rays=None):
+    """`external_reference` ({param: value}, e.g. GRAP's own RAVEN parameters)
+    adds a further horizontal reference line per panel; params it lacks get none.
+    If given, the JND band is centred on it. `pra_fixed` ({param: value}) adds
+    PRA with the double-counted reflection order removed
+    (cmp.drop_double_counted_ism_order), in a lighter orange. PRA's repeats
+    (run's pra_<param>_per_repeat, and `pra_fixed_per_repeat`, {param: array})
+    are drawn as range and +/-1 std bands like misuka's."""
     spp = run["arrays"]["spp"]
     reference_params = run["metadata"]["metrics"]["reference_params"]
+    reference_rays = reference_rays or spp.max()
 
-    UNITS = {"C50": "dB", "C80": "dB", "G": "dB", "TS": "s", "EDT": "s", "T60": "s"}
+    UNITS = {"C50": "dB", "C80": "dB", "G": "dB", "TS": "s", "EDT": "s", "T60": "s", "T30": "s"}
 
     # z-order, back to front: JND band (green) < repeat range (light blue) <
     # +/-1 std (dark blue) < the actual mean/reference lines on top.
     Z_JND, Z_RANGE, Z_STD, Z_LINES = 1, 3, 4, 2
 
-    fig, axs = plt.subplots(2, 3, figsize=(11, 6))
-    fig.suptitle(scenario_name)
-    for ax, param in zip(axs.flat, list(JND_ABS) + list(JND_REL)):
+    fig, axs = plt.subplots(2, 3, figsize=(6.6, 5.0))
+    if scenario_name != "Gewandhaus (125 Hz)":
+        fig.suptitle(scenario_name, fontsize=22)
+    for ax, param in zip(axs.flat, params or list(JND_ABS) + list(JND_REL)):
         vals = run["arrays"][f"misuka_{param}"]
         per_repeat = run["arrays"][f"misuka_{param}_per_repeat"]  # (n_repeats, n_spp)
         std = run["arrays"][f"misuka_{param}_std"]
         pra_val = reference_params[param]
 
-        jnd = JND_ABS[param] if param in JND_ABS else JND_REL[param] * abs(pra_val)
         # Band centered on misuka's own converged (highest-spp) mean, not on
         # PRA's value -- same comparison as before, just read as "is PRA
         # within misuka's own tolerance" instead of the other way round.
         # Falls back to PRA's value if misuka's last value is itself
         # non-finite (e.g. G for l_room_1000m3 -- no line of sight, see
         # parameters_full's g_radius_term docstring).
-        band_center = vals[-1] if np.isfinite(vals[-1]) else pra_val
-        band_lo, band_hi = band_center - jnd, band_center + jnd
+        ext_val = (external_reference or {}).get(param)
+        if ext_val is not None:
+            band_lo, band_hi = jnd_band(param, ext_val)
+        else:
+            band_center = vals[-1] if np.isfinite(vals[-1]) else pra_val
+            band_lo, band_hi = jnd_band(param, band_center, relative_to=pra_val)
         ax.axhspan(band_lo, band_hi, color="C0", alpha=0.15, zorder=Z_JND, label="JND")
 
         ax.fill_between(spp, per_repeat.min(axis=0), per_repeat.max(axis=0),
                         color="C2", alpha=0.15, zorder=Z_RANGE, label="misuka range")
         ax.fill_between(spp, vals - std, vals + std,
-                        color="C2", alpha=0.35, zorder=Z_STD, label=r"misuka ±1 $\sigma$")
+                        color="C2", alpha=0.35, zorder=Z_STD, label=r"misuka $\pm 1\,\sigma$")
 
         ax.semilogx(spp, vals, marker="o", linestyle="-", color="C2", label="misuka", zorder=Z_LINES+1, markersize=2.0)
-        ax.axhline(pra_val, color="C1", label="PRA-hybrid", zorder=Z_LINES)
-        ax.set_ylabel(f"{param} / {UNITS[param]}")
-        ax.set_xlabel("misuka spp")
+        # PRA as small box plots at its own ray count: box +/-1 std, line the
+        # range of the runs, dot the mean. Both are centred on that ray count;
+        # if they overlap vertically, the boxes are cut there: hybrid keeps
+        # the left half, fixed the right half, with the range lines side by
+        # side on the cut and half dots for the means.
+        fixed_val = (pra_fixed or {}).get(param)
+        n_rays = run["metadata"].get("render_params", {}).get("pra_n_rays") or spp.max()
+        hybrid_reps = run["arrays"].get(f"pra_{param}_per_repeat", [pra_val])
+        fixed_reps = (pra_fixed_per_repeat or {}).get(param, None if fixed_val is None else [fixed_val])
+        spread = [(np.asarray(r), color, label, side) for r, color, label, side in (
+            (hybrid_reps, "C1", "PRA-hybrid", -1), (fixed_reps, PRA_COLOR_ALT, "PRA-hybrid (fixed)", +1))
+            if r is not None]
+        extents = [(min(r.min(), r.mean() - r.std()), max(r.max(), r.mean() + r.std())) for r, *_ in spread]
+        overlap = len(extents) == 2 and extents[0][0] <= extents[1][1] and extents[1][0] <= extents[0][1]
+        box_half = 2 ** 0.6
+        for reps, color, label, side in spread:
+            m, s = reps.mean(), reps.std()
+            if overlap:
+                x0, x1 = (n_rays / box_half, n_rays) if side < 0 else (n_rays, n_rays * box_half)
+                # range line next to the cut, shifted by 0.8 pt into its own half
+                line_transform = mtransforms.offset_copy(ax.transData, fig=fig, x=0.8 * side, units="points")
+                dot_style = dict(marker=MarkerStyle("o", fillstyle="left" if side < 0 else "right"),
+                                 markerfacecoloralt="none", markeredgewidth=0)
+                # black outline of the same half only, an open arc on the
+                # unit circle (no line along the cut)
+                edge_arc = Path.arc(90, 270) if side < 0 else Path.arc(-90, 90)
+            else:
+                x0, x1 = n_rays / box_half, n_rays * box_half
+                line_transform = ax.transData
+                dot_style = dict(marker="o", markeredgecolor="black", markeredgewidth=0.5)
+                edge_arc = None
+            ax.add_patch(Rectangle((x0, m - s), x1 - x0, 2 * s, facecolor=color, alpha=0.6,
+                                   edgecolor=color, linewidth=0.8, zorder=Z_LINES + 2))
+            ax.plot([n_rays, n_rays], [reps.min(), reps.max()], color=color, linewidth=1.2,
+                    transform=line_transform, zorder=Z_LINES + 3)
+            ax.plot(n_rays, m, color=color, markersize=5, linestyle="none",
+                    zorder=Z_LINES + 4, label=label, **dot_style)
+            if edge_arc is not None:
+                ax.plot(n_rays, m, marker=edge_arc, markersize=5, linestyle="none",
+                        markerfacecolor="none", markeredgecolor="black",
+                        markeredgewidth=0.5, zorder=Z_LINES + 4)
+        if ext_val is not None:
+            ax.axhline(ext_val, color="black", linestyle="--", linewidth=0.7, zorder=Z_LINES)
+            # RAVEN's own result as a dot at its ray count (one point, so the
+            # dashed style only shows in the legend)
+            ax.plot(reference_rays, ext_val, marker="o", color="black", markersize=2.5,
+                    linestyle="--", linewidth=0.7, label=external_label, zorder=Z_LINES + 4)
+        ax.set_ylabel(f"{param} in {UNITS[param]}")
+
+        if ax in axs[-1]:
+            ax.set_xlabel("number of rays")
         ax.grid(True, which="both", alpha=0.3)
 
         # spp is always well-defined and positive, but `vals` isn't -- a
@@ -845,6 +1081,16 @@ def plot_hybrid_jnd(scenario_name, run):
         # this explicitly from spp itself sidesteps that regardless of what
         # the y-data looks like.
         ax.set_xlim(spp.min(), spp.max())
+        # Three labelled ticks at powers of two (the thesis gives ray counts as
+        # 2^n), small ticks at every power of two in between. The top row
+        # keeps the ticks but drops the labels.
+        lo, hi = int(np.ceil(np.log2(spp.min()))), int(np.floor(np.log2(spp.max())))
+        ax.xaxis.set_major_locator(mticker.FixedLocator(2.0 ** np.round(np.linspace(lo + 2, hi - 1, 3))))
+        ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: rf"$2^{{{round(np.log2(v))}}}$"))
+        ax.xaxis.set_minor_locator(mticker.FixedLocator(2.0 ** np.arange(lo, hi + 1)))
+        ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+        if ax not in axs[-1]:
+            ax.tick_params(axis="x", labelbottom=False)
 
         # y-range: PRA's value must always be visible, and the (now
         # misuka-centered) JND band should be as large a fraction of the
@@ -855,15 +1101,25 @@ def plot_hybrid_jnd(scenario_name, run):
         # ends up smaller than 2/5 -- unavoidable while keeping PRA
         # visible. If PRA is close to/inside the band, the axis is padded
         # out evenly on both sides until the band shrinks to exactly 2/5.
-        band_height = 2 * jnd
-        base_lo, base_hi = min(band_lo, pra_val), max(band_hi, pra_val)
+        band_height = band_hi - band_lo
+        must_show = [v for v in (pra_val, ext_val, fixed_val) if v is not None]
+        must_show += [f(r) for r, *_ in spread for f in (np.min, np.max)]
+        base_lo, base_hi = min(band_lo, *must_show), max(band_hi, *must_show)
         total_height = max(base_hi - base_lo, band_height / 0.4)
-        extra = total_height - (base_hi - base_lo)
+        # 5% margin, so a reference line never sits exactly on the frame
+        extra = total_height - (base_hi - base_lo) + 0.05 * total_height
         ax.set_ylim(base_lo - extra / 2, base_hi + extra / 2)
+        _three_ticks(ax.yaxis, *ax.get_ylim())
     handles, labels = axs.flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=5,
-           bbox_to_anchor=(0.5, 0), frameon=False, fontsize=8)
-    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    # full dots for PRA in the legend, also when the first panel shows halves
+    from matplotlib.lines import Line2D
+    pra_colors = {"PRA-hybrid": "C1", "PRA-hybrid (fixed)": PRA_COLOR_ALT}
+    handles = [Line2D([], [], marker="o", color=pra_colors[l], markeredgecolor="black",
+                      markeredgewidth=0.5, markersize=5, linestyle="none") if l in pra_colors else h
+               for h, l in zip(handles, labels)]
+    fig.tight_layout(rect=[0, 0.2, 1, 1])
+    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 0.19),
+               frameon=False, fontsize=10)
     return fig
 
 
@@ -883,11 +1139,31 @@ def plot_rt_histogram_comparison(scenario_name, run):
         ax.semilogy(times_ms, etc_misuka[:n] / etc_misuka[:n].max(), color=MISUKA_COLOR, label="misuka RT")
         ax.semilogy(times_ms, pra_rt_etc[:n] / pra_rt_etc[:n].max(), color=PRA_COLOR, linestyle="--",
                    label="PRA RT histogram", alpha=0.8)
-    ax.set_xlabel("Time [ms]")
+    ax.set_xlabel("Time in ms")
     ax.set_ylabel("Normalized energy")
     ax.set_xlim(0, min(times_ms[-1], 100))
     ax.legend(fontsize=8)
     ax.set_title(f"{scenario_name}: RT-only, no sinc reconstruction")
+    fig.tight_layout()
+    return fig
+
+
+def plot_gewandhaus_grap_etc(run, xlim_s=None):
+    """misuka's 20 Hz ETC (1 ms bins, scaled so the direct sound carries
+    1/d^2 like GRAP's histogram) over GRAP's RNo01_R1_Histogram 20 Hz column."""
+    a, m = run["arrays"], run["metadata"]["metrics"]
+    t = a["time_1ms_s"]
+    misuka = np.roll(a["etc_1ms_mean"], int(m.get("direct_bin_shift_1ms", 0)))
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    with np.errstate(divide="ignore"):
+        ax.semilogy(t, a["grap_etc_1ms"], color=PRA_COLOR, label="GRAP (RAVEN hybrid)", alpha=0.8)
+        ax.semilogy(t, misuka, color=MISUKA_COLOR, label="misuka", alpha=0.8)
+    ax.set_xlabel("Time in s")
+    ax.set_ylabel("Energy per 1 ms bin")
+    if xlim_s is not None:
+        ax.set_xlim(*xlim_s)
+    ax.legend(fontsize=8)
+    ax.set_title("Gewandhaus R1, 20 Hz")
     fig.tight_layout()
     return fig
 
@@ -923,7 +1199,7 @@ def plot_post_vs_inline_attenuation_sweep(scenario_name, run):
         ax.set_xscale("log")
         ax.set_yscale("log")
         if title.startswith("mean"):
-            ax.set_xlabel("sampling rate [Hz]  (bin width = 1/fs)")
+            ax.set_xlabel("sampling rate in Hz  (bin width = 1/fs)")
         ax.set_ylabel("post vs. inline, |%|")
         ax.set_title(title)
         ax.grid(True, which="both", alpha=0.3)
@@ -963,9 +1239,9 @@ def plot_post_vs_inline_attenuation_time_profile(scenario_name, run, sampling_ra
     for ax in axs:
         ax.axvline(direct_sound_ms, color="black", linestyle=":", linewidth=1,
                   label=f"direct sound ({direct_sound_ms:.1f} ms)")
-        ax.set_xlabel("Time [ms]")
+        ax.set_xlabel("Time in ms")
         ax.grid(True, which="both", alpha=0.3)
-    axs[0].set_ylabel(f"|post vs. inline| [%]  ({window/sampling_rate_hz*1e3:.1f} ms rolling mean)")
+    axs[0].set_ylabel(f"|post vs. inline| in %  ({window/sampling_rate_hz*1e3:.1f} ms rolling mean)")
     axs[0].set_title("full render")
     axs[1].set_title("direct sound / early reflections (zoom)")
     axs[1].set_xlim(0, 30)
@@ -1024,8 +1300,8 @@ def plot_attenuation_frequency_dependence(scenario_name, run):
                 va="bottom", ha="left", color="0.4")
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("frequency [Hz]")
-    ax.set_ylabel("post vs. inline, absolute difference [%]")
+    ax.set_xlabel("frequency in Hz")
+    ax.set_ylabel("post vs. inline, |relative difference| in %")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -1040,15 +1316,15 @@ def _bin_width_x_axes(ax, bin_widths_s, bin_widths_hz):
     ax.set_xscale("log")
     bin_widths_ms = bin_widths_s * 1e3
     ax.set_xticks(bin_widths_ms)
-    ax.set_xticklabels([f"{w:.3g}" for w in bin_widths_ms], fontsize=8)
+    ax.set_xticklabels([f"{w:.3g}" for w in bin_widths_ms], fontsize=13)
     ax.set_xticks([], minor=True)
 
     sampling_axis = ax.secondary_xaxis(
         "top", functions=(lambda ms: 1e3 / np.where(ms == 0, np.nan, ms),
                           lambda hz: 1e3 / np.where(hz == 0, np.nan, hz)))
-    sampling_axis.set_xlabel("sampling rate [Hz]")
+    sampling_axis.set_xlabel("sampling rate in Hz", fontsize=13)
     sampling_axis.set_xticks(bin_widths_hz)
-    sampling_axis.set_xticklabels([f"{f:.0f}" for f in bin_widths_hz], fontsize=8)
+    sampling_axis.set_xticklabels([f"{f:.0f}" for f in bin_widths_hz], fontsize=13)
     sampling_axis.set_xticks([], minor=True)
 
 
@@ -1081,16 +1357,16 @@ def plot_attenuation_bin_width(scenario_name, run):
         ax.plot(bin_widths_s * 1e3, max_err_m[:, j], marker="^", markersize=5,
                 color=color, linestyle="--", label=f"{freq:.0f} Hz, max")
     ax.set_yscale("log")
-    ax.set_xlabel("time-bin width [ms]")
-    ax.set_ylabel("distance error [m]")
+    ax.set_xlabel("time-bin width in ms")
+    ax.set_ylabel("distance error in m")
     ax.grid(True, which="both", alpha=0.3)
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=10, ncol=4, loc="lower center", bbox_to_anchor=(0.5, -0.45), frameon=False)
     _bin_width_x_axes(ax, bin_widths_s, bin_widths_hz)
 
     secondary = ax.secondary_yaxis(
         "right", functions=(lambda m: m / speed_of_sound * 1e3,
                             lambda s: s * speed_of_sound / 1e3))
-    secondary.set_ylabel("time error [ms]")
+    secondary.set_ylabel("time error in ms", fontsize=12)
     fig.tight_layout()
     return fig
 
@@ -1117,17 +1393,57 @@ def plot_attenuation_bin_width_etc_error(scenario_name, run):
                 color=color, label=f"{freq:.0f} Hz, avg")
         ax.plot(bin_widths_s * 1e3, max_abs_pct[:, j], marker="^", markersize=5,
                 color=color, linestyle="--", label=f"{freq:.0f} Hz, max")
-    if np.nanmax(max_abs_pct) >= 99.9:
-        ax.axhline(100.0, linestyle="--", linewidth=0.8, color="0.6")
-        ax.text(bin_widths_s[0] * 1e3, 100.0, " metric bound (100 %)", fontsize=7,
-                va="bottom", ha="left", color="0.4")
+    # if np.nanmax(max_abs_pct) >= 99.9:
+    #     ax.axhline(100.0, linestyle="--", linewidth=0.8, color="0.6")
+    #     ax.text(bin_widths_s[0] * 1e3, 100.0, " metric bound (100 %)", fontsize=7,
+    #             va="bottom", ha="left", color="0.4")
     ax.set_yscale("log")
-    ax.set_xlabel("time-bin width [ms]")
-    ax.set_ylabel("post vs. inline, absolute difference [%]")
+    ax.set_xlabel("time-bin width in ms", fontsize=12)
+    strd="post vs. inline, " + r'$|$' + "relative difference" +r'$|$' + " in %"
+    ax.set_ylabel(strd)
     ax.grid(True, which="both", alpha=0.3)
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=10, ncol=4, loc="lower center", bbox_to_anchor=(0.5, -0.45), frameon=False)
     _bin_width_x_axes(ax, bin_widths_s, bin_widths_hz)
     fig.tight_layout()
+    return fig
+
+
+def plot_attenuation_bin_width_eps(scenario_name, run, show_noise=False):
+    """Energy-weighted error eps = sum|H_post - H_inline| / sum H_inline (in %)
+    of postprocessing against inline attenuation over the time-bin width,
+    with the distance of the bin start (solid, filled) and of the bin centre
+    (dashed, open), mean +/- std over the seeds. `show_noise` adds eps between
+    two inline renders with different seeds (dotted), the Monte Carlo noise of
+    one render on the same scale."""
+    from matplotlib.lines import Line2D
+    a = run["arrays"]
+    bin_widths_ms = a["bin_widths_s"] * 1e3
+    frequencies = a["frequencies_hz"]
+    colors = frequency_colors(frequencies)
+    styles = [("eps_pct", dict(linestyle="-"), "bin start"),
+              ("eps_pct_centre", dict(linestyle="--", markerfacecolor="white"), "bin center")]
+    if show_noise:
+        styles.append(("eps_noise_pct", dict(linestyle=":", marker="^", markerfacecolor="white"),
+                       "Monte Carlo noise"))
+
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    for key, style, _ in styles:
+        for j, color in enumerate(colors):
+            ax.errorbar(bin_widths_ms, a[key][:, j], yerr=a[key + "_std"][:, j], color=color,
+                        **{"marker": "o", "markersize": 4, "capsize": 2, **style})
+    ax.set_yscale("log")
+    ax.set_xlabel("time bin width in ms", fontsize=13)
+    ax.set_ylabel(r"error $\varepsilon$ in %", fontsize=13)
+    ax.grid(True, which="both", alpha=0.3)
+    handles = [Line2D([], [], color=c, linewidth=6) for c in colors]
+    labels = [f"{f:.0f} Hz" for f in frequencies]
+    for _, style, label in styles:
+        handles.append(Line2D([], [], color="black", **{"marker": "o", "markersize": 4, **style}))
+        labels.append(label)
+    ax.legend(handles, labels, fontsize=12, ncol=6, loc="lower center",
+              bbox_to_anchor=(0.5, -0.27), frameon=False)
+    _bin_width_x_axes(ax, a["bin_widths_s"], a["bin_widths_hz"])
+    #fig.tight_layout()
     return fig
 
 
@@ -1142,11 +1458,11 @@ def plot_attenuation_runtime(scenario_name, run):
     `*_test` metric for which one.
     """
     keys = ["runtime_none_ms", "runtime_inline_ms", "runtime_post_ms"]
-    labels = ["no attenuation", "inline", "post-processing"]
+    labels = ["no attenuation", "inline", "postprocessing"]
     colors = [MISUKA_COLOR_ALT2, MISUKA_COLOR, MISUKA_COLOR_ALT]
     samples = [np.asarray(run["arrays"][key], dtype=float) for key in keys]
 
-    fig, ax = plt.subplots(figsize=(6.5, 4))
+    fig, ax = plt.subplots(figsize=(7, 2.5))
     parts = ax.violinplot(samples, showextrema=False)
     for body, color in zip(parts["bodies"], colors):
         body.set_facecolor(color)
@@ -1154,8 +1470,8 @@ def plot_attenuation_runtime(scenario_name, run):
     ax.boxplot(samples, widths=0.12, showfliers=False,
                medianprops=dict(color="black"))
     ax.set_xticks(range(1, len(labels) + 1))
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("runtime [ms]")
+    ax.set_xticklabels(labels, fontsize=14)
+    ax.set_ylabel("runtime in ms", fontsize=14)
     ax.grid(True, axis="y", alpha=0.3)
 
     metrics = run["metadata"]["metrics"]
@@ -1165,65 +1481,59 @@ def plot_attenuation_runtime(scenario_name, run):
         verdict = "significant" if p_value < 0.05 else "not significant"
         ax.set_title(f"inline vs. no attenuation: p = {p_value:.3f} "
                      f"({test_name}, {verdict}, n = {metrics.get('n_repeats')})",
-                     fontsize=10)
+                     fontsize=14)
     fig.tight_layout()
     return fig
 
 
-def plot_speed_of_sound_extremes(scenario_name, run, cmap="viridis"):
+def plot_speed_of_sound_extremes(scenario_name, run, cmap='viridis'):
     """Where `cramer` / `ideal_gas` drift furthest from the ISO 9613-1
     (temperature-only) speed of sound, over a realistic indoor range.
 
     One panel per method: |method - ISO| over temperature and relative
-    humidity at that method's worst-case CO2. CO2 is not an axis because its
-    influence is far weaker than the other two -- see the stored metrics for
-    its optimal value, and for the located maximum (which sits in the
-    corner of the searched box, so the colour map already shows where it is).
+    humidity at that method's worst-case CO2 (`ideal_gas` ignores CO2). Both
+    panels share one colour scale and one colour bar, so the two methods can
+    be compared directly.
     """
     metrics = run["metadata"]["metrics"]
     temperatures = run["arrays"]["temperatures_c"]
     humidities = run["arrays"]["relative_humidities"]
     methods = [m for m in ("cramer", "ideal_gas")
                if f"difference_grid_{m}" in run["arrays"]]
+    vmax = max(float(np.max(run["arrays"][f"difference_grid_{m}"])) for m in methods)
 
-    fig, axs = plt.subplots(1, len(methods), figsize=(5.5 * len(methods), 4.2),
-                            squeeze=False)
+    fig, axs = plt.subplots(1, len(methods), figsize=(2.7 * len(methods) + 0.6, 3.1),
+                            squeeze=False, sharey=True)
     for ax, method in zip(axs[0], methods):
         grid = run["arrays"][f"difference_grid_{method}"]
         mesh = ax.pcolormesh(humidities, temperatures, grid, shading="auto",
-                             cmap=cmap)
-        fig.colorbar(mesh, ax=ax, label=r"$|c_{method} - c_{ISO}|$ [m/s]")
+                             cmap=cmap, vmin=0.0, vmax=vmax)
         ax.grid(False)
         ax.set_xlabel("relative humidity")
-        ax.set_ylabel(r"temperature [$^\circ$C]")
-        ax.set_title(f"{method.replace('_', ' ')} vs. ISO 9613-1\n"
-                     f"max {metrics[f'{method}_max_abs_difference_ms']:.3f} m/s "
-                     f"at {metrics[f'{method}_co2_ppm']:.0f} ppm CO$_2$", fontsize=10)
+        title = (f"{method.replace('_', ' ')} vs. ISO 9613-1\n"
+                 f"max {metrics[f'{method}_max_abs_difference_ms']:.3f} m/s")
+        if method == "cramer":
+            title += f" at {metrics[f'{method}_co2_ppm']:.0f} ppm CO$_2$"
+        ax.set_title(title, fontsize=11)
+    axs[0][0].set_ylabel(r"temperature in $^\circ$C")
     fig.tight_layout()
+    fig.colorbar(mesh, ax=axs[0].tolist(), location="right", fraction=0.05, pad=0.03,
+                 label=r"$|c_{method} - c_{ISO}|$ in m/s")
     return fig
 
 
 # cmr10 carries no degree glyph (same reason axes.unicode_minus is off
 # suite-wide), so the temperature label goes through mathtext.
-# Band drawn behind the goal in the left panel of plot_inverse_rendering.
-# Temperature uses its JND; relative humidity deliberately gets none (only
-# its end value is of interest). Keyed by the run's stored `parameter`, with
-# the leading token of a variant name as fallback for older runs.
-INVERSE_PARAMETER_JND = {
-    "temperature": 0.38,
-    "relative_humidity": None,
-}
-
 INVERSE_PARAMETER_LABELS = {
-    "temperature": r"temperature [$^\circ$C]",
-    "temperature_minus73": r"temperature [$^\circ$C]",
+    "temperature": r"temperature in $^\circ$C",
+    "temperature_minus10": r"temperature in $^\circ$C",
     "relative_humidity": "relative humidity",
 }
 
 
 def plot_inverse_rendering(scenario_name, run, parameter_label=None,
-                           extra_panels=None, etc_xlim=None,
-                           etc_dynamic_range_db=80.0, goal_band=None,
+                           etc_xlim=None,
+                           etc_dynamic_range_db=80.0, etc_floor_db=-100.0,
                            etc_zoom=None,
                            etc_zoom_inset_bounds=(0.52, 0.50, 0.44, 0.44),
                            etc_zoom_span_fraction=0.06,
@@ -1232,21 +1542,20 @@ def plot_inverse_rendering(scenario_name, run, parameter_label=None,
 
     Panels, left to right: the retrieved parameter over the iterations
     (with the goal as a reference line), the loss over the iterations, and
-    the reconstructed ETC against the target ETC.
-
-    `extra_panels` appends further panels without touching that layout --
-    pass a sequence of callables, each invoked as ``panel(ax, run)`` on its
-    own axes to the right (e.g. a runtime-per-iteration panel). The figure
-    widens to keep every panel the same size, so adding one never squeezes
-    the existing three.
+    the reconstructed ETC against the target ETC. Laid out as a 2 x 2 grid
+    of equal panels: parameter and loss on top, the ETC bottom left and the
+    legend in the free slot bottom right.
     """
     arrays, metrics = run["arrays"], run["metadata"]["metrics"]
-    extra_panels = list(extra_panels or [])
-    n_panels = 3 + len(extra_panels)
 
-    fig, axs = plt.subplots(1, n_panels, figsize=(4 * n_panels, 4),
-                            layout="constrained", squeeze=False)
-    axs = axs[0]
+    # bottom row lower than the top row, just high enough for the legend; a
+    # fixed gap between the two top panels keeps the loss label clear of the
+    # parameter panel
+    fig, grid = plt.subplots(2, 2, figsize=(6.6, 4.2), layout="constrained",
+                             gridspec_kw={"height_ratios": (1.35, 1)})
+    fig.get_layout_engine().set(w_pad=0.15, wspace=0.06)
+    axs = [grid[0, 0], grid[0, 1], grid[1, 0]]
+    legend_ax = grid[1, 1]
 
     values = arrays["values"]
     goal = metrics["goal"]
@@ -1256,19 +1565,6 @@ def plot_inverse_rendering(scenario_name, run, parameter_label=None,
             variant, INVERSE_PARAMETER_LABELS.get(variant.split("_")[0], "parameter"))
     label = parameter_label
 
-    # JND band behind the goal line, per retrieved parameter (see
-    # INVERSE_PARAMETER_JND): temperature gets its JND, relative humidity
-    # gets none -- for humidity only the end value is of interest.
-    band = goal_band
-    if band is None:
-        parameter = metrics.get("parameter") or (run["metadata"].get("variant") or "")
-        band = INVERSE_PARAMETER_JND.get(
-            parameter, INVERSE_PARAMETER_JND.get(parameter.split("_")[0]))
-    if band:
-        # mathtext for the sign: cmr10 has no +/- glyph, same reason
-        # axes.unicode_minus is disabled suite-wide.
-        axs[0].axhspan(goal - band, goal + band, color=PRA_COLOR, alpha=0.15,
-                       label=rf"JND: $\pm${band:g}")
     # Mean over the seeds with their full range behind it. `values` is
     # (n_seeds, iterations) for a multi-seed run and 1-D for an older
     # single-run one, which is why both shapes are handled here.
@@ -1287,13 +1583,9 @@ def plot_inverse_rendering(scenario_name, run, parameter_label=None,
     axs[0].axhline(goal, linestyle="dotted", color=PRA_COLOR, label=f"goal: {goal:g}")
     axs[0].plot(iterations[-1], mean_values[-1], marker="o", color=MISUKA_COLOR,
                 label=f"final: {mean_values[-1]:.3g}")
-    converged_at = metrics.get("converged_at", -1)
-    if converged_at is not None and converged_at >= 0:
-        axs[0].axvline(converged_at, linestyle="--", color="0.5",
-                       label=f"converged: {converged_at}")
     axs[0].set_xlabel("iteration")
     axs[0].set_ylabel(label)
-    axs[0].legend(fontsize=8)
+
     axs[0].grid(True, alpha=0.3)
 
     losses = arrays["losses"]
@@ -1309,34 +1601,15 @@ def plot_inverse_rendering(scenario_name, run, parameter_label=None,
     axs[1].set_xlabel("iteration")
     axs[1].set_ylabel("loss (relative squared error)")
     axs[1].grid(True, which="both", alpha=0.3)
+    # Less than two decades: label 1-2-5 steps in plain numbers, the default
+    # labels every minor tick in scientific notation.
+    lo, hi = axs[1].get_ylim()
+    if np.log10(hi / lo) < 2:
+        axs[1].yaxis.set_major_locator(mticker.LogLocator(subs=(1.0, 2.0, 5.0)))
+        axs[1].yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}"))
+        axs[1].yaxis.set_minor_formatter(mticker.NullFormatter())
 
-    # Runtime box plot, inset top right. Once these retrievals are repeated
-    # over several seeds, the run carries one total runtime per seed
-    # (`runtime_per_seed_s`) and that is what gets boxed; until then the
-    # single run's per-iteration times are shown instead, which is the same
-    # quantity at a finer granularity. The y label says which of the two.
-    # One value per optimisation run, not per iteration.
-    runtime_samples = np.asarray(arrays["runtime_per_seed_s"], dtype=float)
-    runtime_title = "runtime / run [s]"
-    inset = axs[1].inset_axes([0.76, 0.58, 0.16, 0.38])
-    inset.boxplot(runtime_samples, widths=0.7, showfliers=False,
-                  medianprops=dict(color=MISUKA_COLOR))
-    # A box plot of a single sample carries no x information, so everything
-    # but the y axis is removed rather than drawn and ignored.
-    inset.set_xticks([])
-    for side in ("top", "right", "bottom"):
-        inset.spines[side].set_visible(False)
-    inset.yaxis.set_major_locator(mticker.LinearLocator(numticks=4))
-    # Precision follows the spread: runtimes that differ by ~1 s render as
-    # four identical labels under a fixed "%.0f".
-    span = float(np.ptp(runtime_samples))
-    decimals = 0 if span >= 10 else (1 if span >= 1 else 2)
-    inset.yaxis.set_major_formatter(mticker.FormatStrFormatter(f"%.{decimals}f"))
-    # Unit in the title, not on a y label: an inset y label is drawn outside
-    # the inset box and lands on top of the loss curve behind it.
-    inset.set_title(runtime_title, fontsize=6)
-    inset.tick_params(axis="y", labelsize=6)
-    inset.patch.set_alpha(0.9)
+
 
     times = arrays["times_s"]
     with np.errstate(divide="ignore"):
@@ -1345,15 +1618,17 @@ def plot_inverse_rendering(scenario_name, run, parameter_label=None,
     axs[2].plot(times, etc_ref_db, color=PRA_COLOR, linewidth=1.8, label="target")
     axs[2].plot(times, etc_final_db, color=MISUKA_COLOR, linewidth=0.8,
                 alpha=0.9, label="reconstructed")
-    axs[2].set_xlabel("time [s]")
-    axs[2].set_ylabel("energy [dB]")
+    axs[2].set_xlabel("time in s")
+    axs[2].set_ylabel("energy in dB")
     if etc_xlim is not None:
         axs[2].set_xlim(*etc_xlim)
     # Empty time bins land at the -300 dB floor above; without an explicit
     # limit they compress the actual decay into a few pixels.
     finite_top = np.max(etc_ref_db)
-    axs[2].set_ylim(finite_top - etc_dynamic_range_db, finite_top + 5)
-    axs[2].legend(fontsize=8, loc="lower left")
+    # The lower limit is fixed (etc_floor_db); below it the ETCs are noise.
+    axs[2].set_ylim(etc_floor_db, finite_top + 5)
+    _three_ticks(axs[2].yaxis, *axs[2].get_ylim())
+
     axs[2].grid(True, alpha=0.3)
 
     # Zoomed inset on the two curves, as in the tutorial's own result figure
@@ -1395,13 +1670,20 @@ def plot_inverse_rendering(scenario_name, run, parameter_label=None,
             axins.patch.set_alpha(0.9)
             axs[2].indicate_inset_zoom(axins, edgecolor="0.5", linewidth=0.6)
 
-    for ax, panel in zip(axs[3:], extra_panels):
-        panel(ax, run)
+    # One legend for all three panels, in the free slot of the grid.
+    handles, labels = [], []
+    for ax in axs:
+        h, l = ax.get_legend_handles_labels()
+        handles.extend(h)
+        labels.extend(l)
+    legend_ax.axis("off")
+    legend_ax.legend(handles, labels, loc="center left", bbox_to_anchor=(-0.05, 0.46), frameon=False, fontsize=11)
+
     return fig
 
 
 def inverse_convergence_table(records):
-    """Iterations-to-convergence and runtime across inverse-rendering runs
+    """Final values, final change and runtime across inverse-rendering runs
     (the distance/frequency variants of block 3b, or any other set)."""
     rows = []
     for name, metrics in records:
@@ -1410,13 +1692,11 @@ def inverse_convergence_table(records):
             "goal": metrics.get("goal"),
             "final": metrics.get("final_value"),
             "abs. error": metrics.get("absolute_error"),
-            "iterations to converge": (metrics.get("converged_at")
-                                       if metrics.get("converged_at", -1) >= 0 else None),
-            "seeds converged": (f"{metrics.get('n_converged')}/{metrics.get('n_seeds')}"
-                                if metrics.get("n_seeds") else None),
-            "distance [m]": metrics.get("distance_m"),
-            "frequency [Hz]": metrics.get("frequency_hz"),
-            "runtime / run [s]": metrics.get("mean_runtime_per_seed_s"),
+            "final std": metrics.get("final_value_std"),
+            "final change (max)": metrics.get("final_change_max"),
+            "distance in m": metrics.get("distance_m"),
+            "frequency in Hz": metrics.get("frequency_hz"),
+            "runtime per run in s": metrics.get("mean_runtime_per_seed_s"),
         })
     return pd.DataFrame(rows).style.format(precision=3)
 
@@ -1459,10 +1739,26 @@ def _feature_edges(triangles, angle_tol_deg=5.0, quantize=6):
     return np.array(segments, dtype=float) if segments else np.zeros((0, 2, 3))
 
 
+EXTRA_RECEIVER_COLORS = ["#6baed6", "#fd8d3c", "#756bb1"]
+
+
+def content_bbox(fig, pad_inches=0.03):
+    """Bounding box (inches) of everything drawn on `fig` that is not white,
+    for savefig(bbox_inches=...). bbox_inches="tight" keeps the empty extent
+    of 3D axes around the model; this crops to what is actually visible."""
+    from matplotlib.transforms import Bbox
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    ys, xs = np.nonzero((rgba[..., :3] < 250).any(axis=-1) & (rgba[..., 3] > 0))
+    h, dpi = rgba.shape[0], fig.dpi
+    return Bbox([[xs.min() / dpi - pad_inches, (h - ys.max() - 1) / dpi - pad_inches],
+                 [(xs.max() + 1) / dpi + pad_inches, (h - ys.min()) / dpi + pad_inches]])
+
+
 def plot_mesh_geometry_3d(triangles_by_group, source, mic, group_colors=None,
                           face_alpha=0.10, edge_alpha=0.25, elev=22, azim=-60,
                           figsize=(8, 7), exclude_groups=(), show_axes=True,
-                          markers_on_top=False):
+                          markers_on_top=False, extra_receivers=None):
     """3D view of a triangle-mesh room with source and receiver marked.
 
     The mesh counterpart of _plot_3d_room, which only handles the extruded
@@ -1477,6 +1773,9 @@ def plot_mesh_geometry_3d(triangles_by_group, source, mic, group_colors=None,
     Faces are drawn nearly transparent on purpose: source and receiver lie
     *inside* the room, and at any usable opacity the near-side walls would
     hide them. Keeping the edges visible still conveys the shape.
+
+    `extra_receivers` ({label: position}) draws further receivers, each with
+    its own dashed path from the source.
     """
     def to_plot_frame(points):
         points = np.asarray(points, dtype=float)
@@ -1492,7 +1791,7 @@ def plot_mesh_geometry_3d(triangles_by_group, source, mic, group_colors=None,
         ax.computed_zorder = False
 
     default_cycle = [MISUKA_COLOR, MISUKA_COLOR_ALT, MISUKA_COLOR_ALT2,
-                     PRA_COLOR_ALT, "#9ecae1"]
+                     PRA_COLOR_ALT, "#9ecae1", "#9e9ac8"]
     group_colors = group_colors or {}
 
     all_vertices = []
@@ -1521,13 +1820,20 @@ def plot_mesh_geometry_3d(triangles_by_group, source, mic, group_colors=None,
     distance = float(np.linalg.norm(np.asarray(source, dtype=float)
                                     - np.asarray(mic, dtype=float)))
 
-    marker_z = 100 if markers_on_top else None
+    #marker_z = 100 if markers_on_top else None
     ax.scatter(*source_p, color="red", s=90, depthshade=False,
-               edgecolor="black", linewidth=0.5, label="source", zorder=marker_z)
-    ax.scatter(*mic_p, color="blue", s=90, depthshade=False, marker="^",
-               edgecolor="black", linewidth=0.5, label="receiver", zorder=marker_z)
+               edgecolor="black", linewidth=0.5, label="source", zorder=100)
+    ax.scatter(*mic_p, color="blue", s=90, depthshade=False, marker="o",
+               edgecolor="black", linewidth=0.5, label="receiver", zorder=100)
     ax.plot(*zip(source_p, mic_p), color="black", linestyle="--", linewidth=1.0,
-            label=f"direct path ({distance:.2f} m)", zorder=marker_z)
+            label=f"direct path ({distance:.2f} m)", zorder=100-10)
+    for (label, point), color in zip((extra_receivers or {}).items(), EXTRA_RECEIVER_COLORS):
+        point_p = to_plot_frame(point)
+        extra_distance = float(np.linalg.norm(np.asarray(source, dtype=float) - np.asarray(point, dtype=float)))
+        ax.scatter(*point_p, color=color, s=90, depthshade=False, marker="o",
+                   edgecolor="black", linewidth=0.5, label=label, zorder=100)
+        ax.plot(*zip(source_p, point_p), color=color, linestyle="--", linewidth=1.0,
+                label=f"path ({extra_distance:.2f} m)", zorder=100-20)
 
     lower, upper = vertices.min(axis=0), vertices.max(axis=0)
     ax.set_xlim(lower[0], upper[0])
@@ -1535,27 +1841,34 @@ def plot_mesh_geometry_3d(triangles_by_group, source, mic, group_colors=None,
     ax.set_zlim(lower[2], upper[2])
     ax.set_box_aspect(tuple(upper - lower))
     if show_axes:
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("z [m]")
-        ax.set_zlabel("height [m]")
+        ax.set_xlabel("x in m")
+        ax.set_ylabel("z in m")
+        ax.set_zlabel("height in m")
     else:
         # Nothing but the geometry and the legend: axes, ticks, grid and the
         # backdrop panes are all suppressed.
         ax.set_axis_off()
     ax.view_init(elev=elev, azim=azim)
-    # Legend outside the axes: inside it covers a good part of the room at
-    # this aspect ratio, and 3D axes do not reflow around it.
-    ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(-0.08, 0.98),
-              framealpha=0.9)
+    # The white axes background reaches beyond the drawn room; Inkscape would
+    # count it into the drawing and shift a cropped figure off centre.
+    ax.patch.set_visible(False)
     # tight_layout misjudges 3D axes and clips the z label; set the margins
     # explicitly instead.
     fig.subplots_adjust(left=0.02, right=0.94, top=0.98, bottom=0.04)
+    # Legend outside the axes: inside it covers a good part of the room at
+    # this aspect ratio, and 3D axes do not reflow around it. Centred under
+    # the drawn room, which does not sit in the middle of its 3D axes.
+    drawn_box = content_bbox(fig, pad_inches=0)
+    ax.legend(loc="upper center", ncol=3, frameon=False, fontsize=10,
+              bbox_to_anchor=((drawn_box.x0 + drawn_box.x1) / 2 / fig.get_figwidth(),
+                              drawn_box.y0 / fig.get_figheight() - 0.01),
+              bbox_transform=fig.transFigure)
     return fig, ax
 
 
 def plot_mesh_sections(triangles_by_group, source, mic, group_colors=None,
                        exclude_groups=(), figsize=(9, 8), linewidth=0.7,
-                       merge_coplanar=True, angle_tol_deg=5.0):
+                       merge_coplanar=True, angle_tol_deg=5.0, extra_receivers=None):
     """Technical plan and elevation of a triangle-mesh room.
 
     Two orthographic projections of the same mesh: a plan view (looking down
@@ -1570,14 +1883,14 @@ def plot_mesh_sections(triangles_by_group, source, mic, group_colors=None,
     from matplotlib.collections import LineCollection
 
     default_cycle = [MISUKA_COLOR, MISUKA_COLOR_ALT, MISUKA_COLOR_ALT2,
-                     PRA_COLOR_ALT, "#9ecae1"]
+                     PRA_COLOR_ALT, "#9ecae1", "#9e9ac8"]
     group_colors = group_colors or {}
     source = np.asarray(source, dtype=float)
     mic = np.asarray(mic, dtype=float)
 
     # (axis index pair, axis labels, panel title) for plan and elevation
-    views = [((0, 2), ("", "z [m]"), "plan view (from above)"),
-             ((0, 1), ("x [m]", "height y [m]"), "side elevation")]
+    views = [((0, 2), ("", "z in m"), ""),
+             ((0, 1), ("x in m", "height y in m"), "")]
 
     # Stacked with a shared x axis and height ratios matching the true
     # extents: at equal scale the plan is far deeper than the elevation is
@@ -1613,8 +1926,15 @@ def plot_mesh_sections(triangles_by_group, source, mic, group_colors=None,
                 linestyle="--", linewidth=1.0, zorder=4)
         ax.scatter(*source[[a, b]], color="red", s=70, zorder=5,
                    edgecolor="black", linewidth=0.5)
-        ax.scatter(*mic[[a, b]], color="blue", s=70, marker="^", zorder=5,
+        ax.scatter(*mic[[a, b]], color="blue", s=70, marker="o", zorder=5,
                    edgecolor="black", linewidth=0.5)
+        for (label, point), color in zip((extra_receivers or {}).items(), EXTRA_RECEIVER_COLORS):
+            point = np.asarray(point, dtype=float)
+            ax.plot(*zip(source[[a, b]], point[[a, b]]), color=color,
+                    linestyle="--", linewidth=1.0, zorder=4)
+            ax.scatter(*point[[a, b]], color=color, s=70, marker="o", zorder=5,
+                       edgecolor="black", linewidth=0.5,
+                       label=label if ax is axs[0] else None)
 
         if xlabel:
             ax.set_xlabel(xlabel)
@@ -1624,7 +1944,218 @@ def plot_mesh_sections(triangles_by_group, source, mic, group_colors=None,
         ax.autoscale_view()
         ax.grid(True, alpha=0.25, linewidth=0.5)
 
-    axs[0].legend(fontsize=7, loc="center left", bbox_to_anchor=(1.01, 0.5),
-                  framealpha=0.9)
+    handles, lables = axs[0].get_legend_handles_labels()
+
+    fig.legend(handles=handles, labels=lables, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.1), frameon=False, fontsize=10)
     fig.tight_layout()
     return fig, axs
+
+
+# =====================================================================
+#   Joint (T, RH) retrieval and retrieval from the RAVEN reference
+#   (atmospheric_evaluation blocks 3d / 3e)
+# =====================================================================
+
+def plot_inverse_joint(run, title=None, goal_label="goal", cmap="viridis"):
+    """Loss landscape over (T, RH) with the optimiser trajectories from every
+    start, the iso-attenuation curves through the goal (one per band), and the
+    retrieved T and RH over the iterations. Runs from the RAVEN retrieval get a
+    fourth panel: misuka's final decay against GRAP's, level-aligned per band."""
+    a, m = run["arrays"], run["metadata"]["metrics"]
+    T, RH = a["landscape_temperature"], a["landscape_relative_humidity"]
+    traj, freqs = a["trajectories"], a["frequencies_hz"]
+    has_grap = "grap_10ms" in a
+    n = 4 if has_grap else 3
+    fig, axs = plt.subplots(1, n, figsize=(4.4 * n, 4.2), layout="constrained",
+                            gridspec_kw={"width_ratios": [1.5] + [1] * (n - 1)})
+    ax = axs[0]
+    with np.errstate(divide="ignore"):
+        z = np.log10(a["landscape"].T)
+    mesh = ax.pcolormesh(T, RH, z, cmap=cmap, shading="auto")
+    fig.colorbar(mesh, ax=ax, label=r"$\log_{10}$ loss")
+    styles = ["--", ":", "-."]
+    for j, f in enumerate(freqs):
+        cs = ax.contour(T, RH, a["alpha_grid"][:, :, j].T, levels=[a["alpha_goal"][j]],
+                        colors="white", linestyles=styles[j % 3], linewidths=1.2)
+        ax.plot([], [], color="0.3", linestyle=styles[j % 3], label=f"equal attenuation, {f/1e3:g} kHz")
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    for k in range(traj.shape[0]):
+        ax.plot(traj[k, :, 0], traj[k, :, 1], color=colors[k % 10], linewidth=1.2)
+        ax.plot(*a["starts"][k], "o", color=colors[k % 10], markersize=5, markeredgecolor="k")
+        ax.plot(*traj[k, -1], "X", color=colors[k % 10], markersize=8, markeredgecolor="k")
+    ax.plot(m["goal_temperature"], m["goal_relative_humidity"], "*", color="red", markersize=14,
+            markeredgecolor="k", label=goal_label)
+    ax.set_xlabel(r"temperature in $^\circ$C")
+    ax.set_ylabel("relative humidity")
+    ax.set_xlim(T[0], T[-1]); ax.set_ylim(RH[0], RH[-1])
+    ax.legend(fontsize=7, loc="lower left", framealpha=0.85)
+    it = np.arange(traj.shape[1])
+    for ax, c, label, goal in ((axs[1], 0, r"temperature in $^\circ$C", m["goal_temperature"]),
+                               (axs[2], 1, "relative humidity", m["goal_relative_humidity"])):
+        for k in range(traj.shape[0]):
+            ax.plot(it, traj[k, :, c], color=colors[k % 10], linewidth=1.0)
+        ax.axhline(goal, color="red", linestyle="dotted", label=goal_label)
+        ax.set_xlabel("iteration"); ax.set_ylabel(label)
+        ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    if has_grap:
+        ax = axs[3]
+        grap, mask = a["grap_10ms"], a["window_mask"].astype(bool)
+        best = int(np.argmin(a["losses"][:, -1]))
+        e = np.asarray(a["etc_final_per_start"][best]).reshape(grap.shape[0], -1)
+        t = (np.arange(grap.shape[0]) + 0.5) * 0.010
+        for j, f in enumerate(freqs):
+            k = mask[:, j]
+            with np.errstate(divide="ignore"):
+                g_db, e_db = 10 * np.log10(grap[:, j]), 10 * np.log10(e[:, j])
+            shift = np.mean(e_db[k] - g_db[k])
+            ax.plot(t[k], g_db[k], color="k", linewidth=1.0, label="GRAP (RAVEN)" if j == 0 else None)
+            ax.plot(t[k], e_db[k] - shift, color=colors[j], linewidth=1.0, alpha=0.85,
+                    label=f"misuka, {f/1e3:g} kHz")
+        ax.set_xlabel("time in s"); ax.set_ylabel("energy per 10 ms bin in dB")
+        ax.grid(True, alpha=0.3); ax.legend(fontsize=7)
+        ax.set_title("best start, level-aligned", fontsize=9)
+    if title:
+        fig.suptitle(title)
+    return fig
+
+
+# =====================================================================
+#   CHORAS results (125 Hz)
+# =====================================================================
+
+def plot_window_energy(windows, results, labels=None):
+    """Energy per time window relative to a reference, in dB, one line per
+    method over the windows (categorical x-axis). The dashed line marks the
+    reference.
+
+    windows : list of window labels; results : {method: list of dB values}
+    Ticks mark the window boundaries; labels and points sit in the middle of
+    their window.
+    """
+    method_colors = {"misuka": MISUKA_COLOR, "PRA": PRA_COLOR, "PRA fixed": PRA_COLOR_ALT}
+    x = np.arange(len(windows)) + 0.5
+    fig, ax = plt.subplots(figsize=(6.4, 3.4), layout="constrained")
+    ax.axhline(0, color="black", linestyle="--", linewidth=1.2, zorder=1, label="reference (GRAP)")
+    for m, y in results.items():
+        ax.plot(x, y, color=method_colors.get(m, "C0"), marker="o", markersize=7,
+                markeredgecolor="black", markeredgewidth=0.6, linewidth=1.5, zorder=3,
+                label=labels.get(m, m) if labels else m)
+    ax.set_xticks(np.arange(len(windows) + 1), [""] * (len(windows) + 1))
+    ax.set_xticks(x, windows, minor=True, fontsize=9)
+    ax.tick_params(axis="x", which="minor", length=0)
+    ax.set_xlim(0, len(windows))
+    ax.set_xlabel("time window after the direct sound in ms")
+    ax.set_ylabel("energy relative to GRAP in dB")
+    ax.grid(True, alpha=0.3)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    fig.legend(loc="outside lower center", ncol=len(results) + 1, frameon=False, fontsize=10)
+    return fig
+
+
+def plot_scattering_sweep(scattering, results, reference, jnd, units, labels=None, reference_at=None):
+    """Room acoustic parameters over the scattering coefficient, one panel per
+    parameter and one line per method, with the reference (dashed) and its JND
+    band. `reference_at` marks the scattering coefficient the reference
+    corresponds to (dotted vertical line).
+
+    scattering : list of coefficients; results : {method: {param: list}}
+    """
+    params = list(reference)
+    method_colors = {"misuka": MISUKA_COLOR, "PRA": PRA_COLOR, "PRA fixed": PRA_COLOR_ALT}
+    ncols = 3
+    nrows = len(params) // ncols + 1  # one slot left over for the legend
+    fig, axs = plt.subplots(nrows, ncols, figsize=(6.6, 2.25 * nrows), layout="constrained")
+    fig.get_layout_engine().set(h_pad=0.12)  # small gap between the rows
+    axs = axs.ravel()
+    for ax, p in zip(axs, params):
+        ref, band = reference[p], jnd[p]
+        ax.axhspan(ref - band, ref + band, color="C0", alpha=0.15, linewidth=0, zorder=0)
+        ax.axhline(ref, color="black", linestyle="--", linewidth=1.2, zorder=1)
+        if reference_at is not None:
+            ax.axvline(reference_at, color="black", linestyle=":", linewidth=1.0, zorder=1)
+        for m, vals in results.items():
+            ax.plot(scattering, vals[p], color=method_colors.get(m, "C0"), marker="o", markersize=6,
+                    markeredgecolor="black", markeredgewidth=0.6, linewidth=1.5, zorder=3)
+        ax.set_title(f"{p} in {units[p]}")
+        ax.set_xlabel("scattering coefficient", fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+    handles = [plt.Rectangle((0, 0), 1, 1, color="C0", alpha=0.15),
+               plt.Line2D([], [], color="black", linestyle="--")] + \
+              [plt.Line2D([], [], color=method_colors.get(m, "C0"), marker="o", markersize=6,
+                          markeredgecolor="black", markeredgewidth=0.6) for m in results]
+    names = ["JND", "reference (RAVEN)"] + [labels.get(m, m) if labels else m for m in results]
+    for ax in axs[len(params):]:
+        ax.axis("off")
+    axs[-1].legend(handles, names, loc="center", frameon=False, fontsize=13)
+    return fig
+
+
+def plot_choras_parameters(rows, units, labels=None, colors=None, reference_label="reference (RAVEN)",
+                           hollow=()):
+    """One panel per room acoustic parameter and frequency band: the value each
+    CHORAS method reports (markers in the suite's method colours), the reference
+    (black, dashed) and its JND band (blue, as in plot_hybrid_jnd). Each y-axis
+    is zoomed to the values and the band, so that "within the JND" can be read
+    off directly.
+
+    rows : {band_label: (results, reference, jnd)}, one figure row per band, with
+           results {method: {param: value}} and reference / jnd {param: value};
+    units : {param: unit}; colors : {method: colour}, overrides the defaults;
+    hollow : methods drawn with an open marker and a dashed stem
+    """
+    first_results, first_reference, _ = next(iter(rows.values()))
+    params, methods = list(first_reference), list(first_results)
+    method_colors = {"misuka": MISUKA_COLOR, "PRA": PRA_COLOR, "PRA fixed": PRA_COLOR_ALT, **(colors or {})}
+    colors = [method_colors.get(m, "C0") for m in methods]
+    names = [labels.get(m, m) if labels else m for m in methods]
+    fig, axs = plt.subplots(len(params), len(rows), figsize=(6.6, 1.45 * len(params) + 0.5),
+                            layout="constrained", squeeze=False)
+    x = np.arange(len(methods))
+    for r, (band_label, (results, reference, jnd)) in enumerate(rows.items()):
+        for c, p in enumerate(params):
+            ax = axs[c, r]
+            ref, band = reference[p], jnd[p]
+            ax.axhspan(ref - band, ref + band, color="C0", alpha=0.15, linewidth=0, zorder=0)
+            ax.axhline(ref, color="black", linestyle="--", linewidth=1.2, zorder=1)
+            values = [results[m][p] for m in methods]
+            for xi, v, col, m in zip(x, values, colors, methods):
+                open_ = m in hollow
+                ax.plot([xi, xi], [ref, v], color=col, linewidth=1.5, zorder=2,
+                        linestyle="--" if open_ else "-")
+                ax.plot(xi, v, "o", color=col, markersize=9, zorder=3,
+                        markerfacecolor="white" if open_ else col,
+                        markeredgecolor=col if open_ else "black", markeredgewidth=1.5 if open_ else 0.6)
+                ax.annotate(f"{v:.3g}", (xi, v), textcoords="offset points", xytext=(7, -3),
+                            va="center", fontsize=10, color="black", zorder=4,
+                            bbox=dict(boxstyle="square,pad=0.05", facecolor="white",
+                                      edgecolor="none", alpha=0.7))
+            lo, hi = min(min(values), ref - band), max(max(values), ref + band)
+            pad = 0.12 * (hi - lo)
+            ax.set_ylim(lo - pad, hi + pad)
+            ax.set_xlim(-0.6, len(methods) - 0.2)
+            if c == len(params) - 1:
+                ax.set_xticks(x, names, fontsize=10, rotation=30, ha="right", rotation_mode="anchor")
+            else:
+                ax.set_xticks(x, [""] * len(methods))
+            if c == 0:
+                ax.set_title(band_label.replace("\n", ", "))
+            if r == 0:
+                ax.set_ylabel(f"{p} in {units[p]}")
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.set_axisbelow(True)
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+    handles = [plt.Rectangle((0, 0), 1, 1, color="C0", alpha=0.15),
+               plt.Line2D([], [], color="black", linestyle="--")] + \
+              [plt.Line2D([], [], marker="o", color=col, linestyle="", markersize=8,
+                          markerfacecolor="white" if m in hollow else col,
+                          markeredgecolor=col if m in hollow else "black",
+                          markeredgewidth=1.5 if m in hollow else 0.6) for col, m in zip(colors, methods)]
+    fig.legend(handles, ["JND", reference_label] + names, loc="outside lower center",
+               ncol=3, frameon=False, fontsize=10)
+    return fig

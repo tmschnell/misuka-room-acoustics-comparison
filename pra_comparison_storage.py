@@ -107,12 +107,17 @@ def save_run(section, scenario, *, metrics=None, arrays=None, room=None,
     -------
     str : the run's directory path.
     """
-    if misuka_variant is None:
-        try:
-            import mitsuba as mi
+    misuka_build = None
+    try:
+        import mitsuba as mi
+        import sys
+        # which interpreter/build rendered this (several misuka builds coexist
+        # in separate environments, e.g. misuka-no-atten-cost)
+        misuka_build = dict(python=sys.executable, mitsuba=os.path.dirname(mi.__file__))
+        if misuka_variant is None:
             misuka_variant = mi.variant()
-        except Exception:
-            misuka_variant = None
+    except Exception:
+        pass
     if timestamp is None:
         import datetime
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -127,12 +132,25 @@ def save_run(section, scenario, *, metrics=None, arrays=None, room=None,
         "variant": variant,
         "timestamp": timestamp,
         "misuka_variant": misuka_variant,
+        "misuka_build": misuka_build,
         "render_params": render_params or {},
         "room": room or {},
         "metrics": metrics or {},
         "extra": extra or {},
         "array_names": sorted(arrays.keys()) if arrays else [],
     }
+    # IR-start evaluations since the last save (see pra_comparison_metrics.
+    # ir_start); looked up via sys.modules so storage stays import-light.
+    import sys
+    metrics_module = sys.modules.get("pra_comparison_metrics")
+    if metrics_module is not None and metrics_module.IR_START_LOG:
+        log = metrics_module.IR_START_LOG
+        metadata["time_origin"] = metrics_module.IR_START_CONVENTION
+        metadata["ir_start"] = dict(
+            n_evaluations=len(log), n_fallback=sum(e["fallback"] for e in log),
+            fallback_cases=[e for e in log if e["fallback"]][:50],
+            tolerance_s=metrics_module.IR_START_TOLERANCE_S)
+        log.clear()
 
     with open(os.path.join(path, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2, default=_json_default)

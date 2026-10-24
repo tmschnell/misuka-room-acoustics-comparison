@@ -1,0 +1,7 @@
+{
+ "description": "One PRA response per band, simulated with frequency-independent absorption at the GRAP values of that band (1e6 rays, 0.5 m receiver, room-wide scattering 0.0195, 44.1 kHz, ISM order 3 with the maximum order counted once, no air attenuation), evaluated once with CHORAS's calculate_room_acoustic_parameters in the octave band and once broadband with otherwise identical processing (start detection on the broadband signal, pyrato EDC). Units: s, s, dB, %, ms.",
+ "125": {"band": {"edt": 1.627, "t30": 2.150, "c80": 2.106, "d50": 24.997, "ts": 117.193},
+         "broadband": {"edt": 1.928, "t30": 2.139, "c80": 2.764, "d50": 52.493, "ts": 93.912}},
+ "2000": {"band": {"edt": 2.071, "t30": 2.502, "c80": 1.042, "d50": 45.245, "ts": 115.579},
+          "broadband": {"edt": 2.027, "t30": 2.491, "c80": 1.699, "d50": 47.121, "ts": 110.427}}
+}

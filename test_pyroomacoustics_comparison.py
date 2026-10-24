@@ -280,7 +280,8 @@ def misuka_scene_dict(shapes, source_pos, mic_pos, source_radius,
 
 
 def render_misuka(scene, max_time, max_energy_loss=80.0, spp=MISUKA_SPP, seed=0, sensor=None,
-                   atmosphere=False, apply_attenuation=True, speed_of_sound=None):
+                   atmosphere=False, apply_attenuation=True, speed_of_sound=None,
+                   acoustic_medium=None):
     # 80 dB matches PRA_ENERGY_THRES above (10**(-80/10) = 1e-8): otherwise
     # misuka's paths would be cut off earlier or later than PRA's rays,
     # producing an artificial cliff to zero in the tail that has nothing to
@@ -311,15 +312,20 @@ def render_misuka(scene, max_time, max_energy_loss=80.0, spp=MISUKA_SPP, seed=0,
         # skips attenuation -- the "raw" render compare_atmosphere_methods()
         # below needs as a common starting point for both the inline and
         # post-processing attenuation methods, at the *same* speed of sound.
-        integrator_dict["acoustic_medium"] = {
-            "temperature": ATMO_TEMPERATURE,
-            "relative_humidity": ATMO_RELATIVE_HUMIDITY,
-            "atmospheric_pressure": ATMO_PRESSURE,
-            "saturation_vapor_pressure": ATMO_SATURATION_VAPOR_PRESSURE,
-            "co2_ppm": ATMO_CO2_PPM,
-            "speed_of_sound_method": ATMO_SPEED_OF_SOUND_METHOD,
-            "apply_attenuation": apply_attenuation,
-        }
+        # An explicit `acoustic_medium` (e.g. atmospheric_evaluation's
+        # misuka standard medium) replaces the ATMO_* defaults.
+        if acoustic_medium is not None:
+            integrator_dict["acoustic_medium"] = dict(acoustic_medium, apply_attenuation=apply_attenuation)
+        else:
+            integrator_dict["acoustic_medium"] = {
+                "temperature": ATMO_TEMPERATURE,
+                "relative_humidity": ATMO_RELATIVE_HUMIDITY,
+                "atmospheric_pressure": ATMO_PRESSURE,
+                "saturation_vapor_pressure": ATMO_SATURATION_VAPOR_PRESSURE,
+                "co2_ppm": ATMO_CO2_PPM,
+                "speed_of_sound_method": ATMO_SPEED_OF_SOUND_METHOD,
+                "apply_attenuation": apply_attenuation,
+            }
     else:
         # speed_of_sound=None (the default) keeps every existing call site's
         # behavior unchanged; an explicit override is used by scenarios that
@@ -327,6 +333,15 @@ def render_misuka(scene, max_time, max_energy_loss=80.0, spp=MISUKA_SPP, seed=0,
         # Gewandhaus reproduction at c=343.64 m/s) without touching the
         # shared SPEED_OF_SOUND constant every other scenario relies on.
         integrator_dict["speed_of_sound"] = speed_of_sound if speed_of_sound is not None else SPEED_OF_SOUND
+        # Explicitly off: on the CHORAS misuka build, omitting acoustic_medium
+        # still attenuates with misuka's standard medium (20 C / 50 % RH).
+        # With this flag every build renders attenuation-free; the
+        # no-attenuation-cost build additionally skips the exp() entirely.
+        integrator_dict["acoustic_medium"] = {"apply_attenuation": False}
+        # Explicit medium (e.g. CHORAS's fixed 20 C / 50 % RH with attenuation
+        # on); timing still uses the explicit speed_of_sound above.
+        if acoustic_medium is not None:
+            integrator_dict["acoustic_medium"] = dict(acoustic_medium)
     integrator = mi.load_dict(integrator_dict)
     kwargs = {"sensor": sensor} if sensor is not None else {}
     etc = integrator.render(scene, seed=seed, spp=spp, **kwargs)
@@ -627,7 +642,20 @@ def align_hull_to_center_lossless(energy_hull_model, radius, sampling_rate, spee
     return shift_later_lossless(energy_hull_model, n_samples)
 
 
-def render_pra_frac_delay_stripped(room, n_time_bins):
+def drop_double_counted_ism_order(room):
+    """Work around a double count in pyroomacoustics' hybrid: its ray tracer
+    logs specular paths from reflection order max_order on (libroom_src/
+    room.cpp, simul_ray: `specular_counter < ism_order` skips only orders
+    < max_order), while the ISM also covers order max_order. Hides the ISM's
+    order-max_order image sources, so that order is counted once, by the ray
+    tracer. Leaves the ray tracer untouched, so the same seed gives the same
+    ray-traced part as an unpatched run. Call before compute_rir()."""
+    room.image_source_model()
+    for s, source in enumerate(room.sources):
+        room.visibility[s][:, source.orders == room.max_order] = 0
+
+
+def render_pra_frac_delay_stripped(room, n_time_bins, factor=BIN_FACTOR):
     """Like render_pra, but also strips pyroomacoustics' own
     frac_delay_length//2-sample RIR lead-in (pra_rir_time_offset_samples(),
     see the "Direct-sound time-axis alignment" section above) before
@@ -638,17 +666,18 @@ def render_pra_frac_delay_stripped(room, n_time_bins):
     sensitive to where exactly t=0 is defined on an absolute time axis.
     Kept as a separate function rather than changing render_pra itself,
     which several other, already-verified call sites rely on unchanged.
+    `factor` is the room's sampling rate in multiples of SAMPLING_RATE.
     """
     room.compute_rir()
     rir = np.asarray(room.rir[0][0], dtype=np.float64)
     rir = rir[pra_rir_time_offset_samples():]
     energy = rir ** 2
-    n_needed = n_time_bins * BIN_FACTOR
+    n_needed = n_time_bins * factor
     if energy.shape[0] < n_needed:
         energy = np.pad(energy, (0, n_needed - energy.shape[0]))
     else:
         energy = energy[:n_needed]
-    return energy.reshape(n_time_bins, BIN_FACTOR).sum(axis=1)
+    return energy.reshape(n_time_bins, factor).sum(axis=1)
 
 
 def leading_edge_bin(energy, threshold_fraction=0.02):
@@ -994,9 +1023,11 @@ def scenario_auditorium_complex():
 # for being much smaller than the auditorium (296 triangles vs. ~5100) --
 # small enough that pyroomacoustics' ISM stays fast even at the "hybrid"
 # order (see pra_comparison_gewandhaus.py's own docstring for the verified
-# timings and the two explicitly-agreed simplifications: the existing
-# 3-material grouping reused as-is, and a freshly chosen source/mic pair
-# rather than GRAP's own unverifiable R1 coordinates).
+# timings). Uses GEWANDHAUS_CANONICAL exclusively (20Hz/0.1m/343.99 m/s/
+# six GRAP materials/GRAP S1-R1) -- there is no other Gewandhaus
+# configuration in this suite any more; see that module's docstring for why
+# an earlier 1kHz/0.3m/self-chosen-position variant was discarded rather
+# than kept alongside it.
 GEWANDHAUS_MAX_TIME = 4.0
 # PRA's own reference ray count: Richter's Nr (last_peak=0.2315s reference,
 # see necessary_rays()) is ~2.59M; rounded up for margin. Far below the
@@ -1019,7 +1050,11 @@ GEWANDHAUS_SPP_VALUES = [2 ** k for k in range(10, 24)]  # 1,024 .. 8,388,608
 def scenario_gewandhaus():
     import pra_comparison_gewandhaus as gw
     max_time = GEWANDHAUS_MAX_TIME
-    scene_dict = gw.build_misuka_scene_dict(max_time, SAMPLING_RATE, frequencies=str(FREQUENCY_HZ))
+    # No frequency/position/radius overrides: this is the misuka-vs-PRA
+    # comparison, which must always be GEWANDHAUS_CANONICAL. Prints a header
+    # of what it actually built; build_pra_room's own require_canonical=True
+    # default additionally aborts if the PRA side ever drifted from it.
+    scene_dict = gw.build_misuka_scene_dict_richter(max_time, SAMPLING_RATE)
     return dict(
         name="gewandhaus",
         max_time=max_time,
@@ -1028,6 +1063,7 @@ def scenario_gewandhaus():
             order, fs=int(BIN_FACTOR * SAMPLING_RATE), hist_bin_size=1.0 / SAMPLING_RATE,
             n_rays=GEWANDHAUS_PRA_N_RAYS, energy_thres=PRA_ENERGY_THRES, time_thres=max_time, **kw),
         spp_values=GEWANDHAUS_SPP_VALUES,
+        speed_of_sound=gw.GEWANDHAUS_CANONICAL["speed_of_sound"],
         period_s=None,
     )
 
@@ -1215,7 +1251,7 @@ def format_report(scenario_name, mode_name, metrics):
     return "\n".join(lines)
 
 
-def compare_atmosphere(scenario, seed=0):
+def compare_atmosphere(scenario, seed=0, medium=None):
     """Render misuka twice for the same scenario -- without and with inline
     atmospheric attenuation (see render_misuka's `atmosphere` flag) -- and
     compare both the resulting acoustic descriptors and the wall-clock
@@ -1239,7 +1275,8 @@ def compare_atmosphere(scenario, seed=0):
 
     t0 = time.perf_counter()
     e_atmo = render_misuka(scenario["misuka_scene"], scenario["max_time"],
-                            spp=spp, seed=seed, sensor=sensor, atmosphere=True)
+                            spp=spp, seed=seed, sensor=sensor, atmosphere=True,
+                            acoustic_medium=medium)
     runtime_atmo = time.perf_counter() - t0
 
     # Distance for the post-processing attenuation is derived from
@@ -1255,10 +1292,12 @@ def compare_atmosphere(scenario, seed=0):
     # the still-public energy_attenuation_coefficient() -- so it remains a
     # fair stand-in for the post-processing approach's cost.
     t0 = time.perf_counter()
+    m = medium or dict(temperature=ATMO_TEMPERATURE, relative_humidity=ATMO_RELATIVE_HUMIDITY,
+                       atmospheric_pressure=ATMO_PRESSURE)
     apply_pure_tone_attenuation(
         e_no_atmo, sampling_rate=SAMPLING_RATE, speed_of_sound_ms=SPEED_OF_SOUND,
-        temperature=ATMO_TEMPERATURE, frequencies=[FREQUENCY_HZ],
-        relative_humidity=ATMO_RELATIVE_HUMIDITY, atmospheric_pressure=ATMO_PRESSURE)
+        temperature=m["temperature"], frequencies=[FREQUENCY_HZ],
+        relative_humidity=m["relative_humidity"], atmospheric_pressure=m["atmospheric_pressure"])
     runtime_post_process = time.perf_counter() - t0
     runtime_post_total = runtime_no_atmo + runtime_post_process
 
@@ -1325,7 +1364,8 @@ def _scalar(x):
 
 
 def apply_pure_tone_attenuation(etc, sampling_rate, speed_of_sound_ms, temperature,
-                                 frequencies, relative_humidity, atmospheric_pressure):
+                                 frequencies, relative_humidity, atmospheric_pressure,
+                                 bin_offset=0.0):
     """Local reimplementation of misuka's (now-removed, see acoustic.h's
     former apply_pure_tone_attenuation()) post-processing air attenuation:
     scales each time bin of `etc` by exp(-distance * decay), where distance
@@ -1334,7 +1374,9 @@ def apply_pure_tone_attenuation(etc, sampling_rate, speed_of_sound_ms, temperatu
     mi.acoustic.energy_attenuation_coefficient(), which is still part of
     misuka's public API. `etc` is (n_time_bins, n_frequencies), row-major
     (also accepts any shape whose total size is a multiple of
-    len(frequencies), same as the original).
+    len(frequencies), same as the original). `bin_offset` picks the time
+    within each bin that sets its distance, in bin widths: 0 is the bin
+    start (the original's choice), 0.5 the bin centre.
     """
     etc = np.asarray(etc, dtype=np.float64)
     orig_shape = etc.shape
@@ -1350,7 +1392,7 @@ def apply_pure_tone_attenuation(etc, sampling_rate, speed_of_sound_ms, temperatu
         for f in frequencies
     ])  # (n_frequencies,), 1/m
 
-    distance = (np.arange(n_time_bins) / sampling_rate) * speed_of_sound_ms  # (n_time_bins,)
+    distance = ((np.arange(n_time_bins) + bin_offset) / sampling_rate) * speed_of_sound_ms  # (n_time_bins,)
     attenuated = etc_flat * np.exp(-distance[:, None] * decay[None, :])
     return attenuated.reshape(orig_shape)
 

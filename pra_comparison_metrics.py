@@ -65,13 +65,56 @@ def necessary_rays(detector_radius, speed_of_sound, t_max, alpha=0.0001):
 # explicitly, the same way the official pyrato docstring examples plot an
 # EDC (edc/edc.time[..., 0]).
 
+# ---------------------------------------------------------------------
+# Time origin of C50/C80/D50/TS (and G's direct-sound window): the start of
+# the impulse response, ISO 3382-1 Annex A -- not the emission time t=0,
+# which silently counts the source-receiver propagation delay into the early
+# window/centre time (for Gewandhaus R1: 33 ms, i.e. C50 off by ~3 dB, TS by
+# ~33 ms). Detection is pyfar's ISO implementation (the one pyrato's own
+# time_shift uses): last sample more than 20 dB below the maximum before
+# it. If that lands more than IR_START_TOLERANCE_S away from the analytic
+# expectation (typically: too few rays hit the direct sound, so a reflection
+# was detected instead), the analytic value is used and the fallback is
+# recorded -- storage.save_run writes IR_START_LOG into the run's metadata.
+IR_START_TOLERANCE_S = 1e-3
+IR_START_CONVENTION = "impulse-response start (ISO 3382-1, pyfar find_impulse_response_start, 20 dB)"
+IR_START_LOG = []
+
+
+def ir_start(energy, sampling_rate, expected_start_s=None, tolerance_s=IR_START_TOLERANCE_S):
+    """Start sample of an energy signal (ETC, squared RIR or histogram).
+
+    `expected_start_s` is where the direct sound analytically begins in
+    *this* signal: misuka unaligned (d - source_radius)/c (hull), misuka
+    after align_hull_to_center_lossless d/c, PRA frac-delay-stripped d/c
+    (unstripped room.rir: plus frac_delay_length//2 samples), GRAP histogram
+    its "Direct sound delay". Returns (start_sample, used_fallback).
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # pyfar's SNR heuristic assumes measured noise tails
+        detected = int(np.ravel(pf.dsp.find_impulse_response_start(
+            pf.Signal(np.sqrt(np.maximum(energy, 0.0)), sampling_rate)))[0])
+    # pyfar returns the last sample *before* the onset -- compare the onset
+    # sample itself, which matters for coarse (1 ms histogram) sampling.
+    fallback = (expected_start_s is not None
+                and abs((detected + 1) / sampling_rate - expected_start_s) > tolerance_s)
+    # same "last sample before the onset" convention as pyfar's detection
+    start = max(int(np.floor(expected_start_s * sampling_rate)) - 1, 0) if fallback else detected
+    IR_START_LOG.append(dict(detected_s=detected / sampling_rate, expected_s=expected_start_s,
+                             fallback=bool(fallback)))
+    return start, fallback
+
+
 def pyrato_edc(energy, sampling_rate=cmp.SAMPLING_RATE):
     edc = pyrato.edc.schroeder_integration(pf.Signal(energy, sampling_rate), is_energy=True)
     return edc / edc.time[..., 0]  # 0 dB at t=0, required by reverberation_time_linear_regression
 
 
-def pyrato_metrics(energy):
-    '''T20, T30, C50, D50 for one energy array, via pyrato (ISO 3382).'''
+def pyrato_metrics(energy, expected_start_s=None):
+    '''T20, T30, C50, D50 for one energy array, via pyrato (ISO 3382), from
+    the impulse-response start (see ir_start; no fallback without
+    expected_start_s).'''
+    energy = energy[ir_start(energy, cmp.SAMPLING_RATE, expected_start_s)[0]:]
     with warnings.catch_warnings():
         # Some scenarios (by design, see coincident_reflections/flutter_corridor
         # in the .py suite) don't have enough dynamic range for a clean T20/T30
@@ -89,8 +132,8 @@ def pyrato_metrics(energy):
 
 
 def parameters_full(etc, distance, source_radius, sampling_rate=cmp.SAMPLING_RATE,
-                    speed_of_sound=cmp.SPEED_OF_SOUND, g_radius_term=None):
-    """C50, C80, EDT, T60 via pyrato -- the same pyrato_edc()-based mechanism
+                    speed_of_sound=cmp.SPEED_OF_SOUND, g_radius_term=None, expected_start_s=None):
+    """C50, C80, EDT, T60, T30 via pyrato -- the same pyrato_edc()-based mechanism
     pyrato_metrics() above already uses for T20/T30/C50/D50, extended with
     early_time_limit=80 (C80) and T="EDT"/"T60" (both natively supported by
     reverberation_time_linear_regression). G and TS have no pyrato equivalent
@@ -119,24 +162,38 @@ def parameters_full(etc, distance, source_radius, sampling_rate=cmp.SAMPLING_RAT
         widened window cancel exactly for a lossless shift) -- G's
         persistent misuka-vs-PRA gap is unrelated to alignment, see the
         module-level "not meaningful in absolute terms" caveat instead.
+
+    expected_start_s : float, optional
+        Analytic direct-sound onset in `etc`, for ir_start's fallback check.
+        Defaults to distance/speed_of_sound -- correct for every current
+        caller (misuka after align_hull_to_center_lossless, PRA frac-delay-
+        stripped); pass (distance - source_radius)/c for an unaligned misuka
+        ETC. C50/C80/TS and G's direct-sound window start at the detected IR
+        start (see ir_start), EDT/T30/T60 are unaffected by the origin.
     """
     if g_radius_term is None:
         g_radius_term = source_radius
+    if expected_start_s is None:
+        expected_start_s = distance / speed_of_sound
+
+    start, _ = ir_start(etc, sampling_rate, expected_start_s)
+    times = np.arange(len(etc)) / sampling_rate
+    etc_ir = etc[start:]
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        edc_curve = pyrato_edc(etc, sampling_rate)
+        edc_curve = pyrato_edc(etc_ir, sampling_rate)
         c50 = float(pyrato.parameters.clarity(edc_curve, early_time_limit=50)[0])
         c80 = float(pyrato.parameters.clarity(edc_curve, early_time_limit=80)[0])
         the_edt = float(pyrato.parameters.reverberation_time_linear_regression(edc_curve, "EDT")[0])
         the_t60 = float(pyrato.parameters.reverberation_time_linear_regression(edc_curve, "T60")[0])
+        the_t30 = float(pyrato.parameters.reverberation_time_linear_regression(edc_curve, "T30")[0])
 
-    times = np.arange(len(etc)) / sampling_rate
-    ts = float(np.sum(etc * times) / np.sum(etc))
+    ts = float(np.sum(etc_ir * times[:len(etc_ir)]) / np.sum(etc_ir))
 
     direct_sound_end = distance / speed_of_sound + g_radius_term / speed_of_sound
     end_bin = int(np.argmin(np.abs(direct_sound_end - times)))
-    free_field_proxy = (distance ** 2 / 10 ** 2) * etc[:end_bin + 1]
+    free_field_proxy = (distance ** 2 / 10 ** 2) * etc_ir[:max(end_bin - start + 1, 0)]
     proxy_energy = float(np.sum(free_field_proxy))
     if proxy_energy == 0.0:
         # distance/c assumes a straight-line path exists at all -- false for
@@ -149,9 +206,9 @@ def parameters_full(etc, distance, source_radius, sampling_rate=cmp.SAMPLING_RAT
         # plot_hybrid_jnd's np.isfinite() filtering already expects.
         g = float("nan")
     else:
-        g = float(10 * np.log10(np.sum(etc) / proxy_energy))
+        g = float(10 * np.log10(np.sum(etc_ir) / proxy_energy))
 
-    return dict(C50=c50, C80=c80, G=g, EDT=the_edt, T60=the_t60, TS=ts)
+    return dict(C50=c50, C80=c80, G=g, EDT=the_edt, T60=the_t60, T30=the_t30, TS=ts)
 
 
 # parameters_full() above applies no cross-renderer time alignment at all
@@ -190,11 +247,31 @@ def check_alignment_offset_negligible(source_radius, scenario_name=None,
     return offset_bins
 
 
-# JND per ISO 3382-1 / Masterarbeit Table 1. C50/C80 use the D50 JND (1 dB) as
-# a practical approximation -- for a precise C50/C80 JND, derive it from D50
-# via ISO 3382's own conversion instead.
+# JND per ISO 3382-1 / Masterarbeit Table 1. C50 has no JND of its own: as in
+# Richter's thesis it is derived from the D50 JND of 0.05 via
+# C50 = 10 lg(D50 / (1 - D50)), see jnd_band(). The 1 dB in JND_ABS is only a
+# fallback for callers that need a single symmetric number.
 JND_ABS = dict(C50=1.0, C80=1.0, G=1.0, TS=0.010)   # absolute JND
 JND_REL = dict(EDT=0.05, T60=0.05)                   # relative JND (5%)
+D50_JND = 0.05
+
+
+def c50_from_d50(d50):
+    return 10 * np.log10(d50 / (1 - d50))
+
+
+def jnd_band(param, value, relative_to=None):
+    """(lower, upper) JND band around `value`. C50 follows Richter: shift the
+    corresponding D50 by +-0.05 and convert back, which gives a slightly
+    asymmetric band. Relative JNDs use `relative_to` (default `value`)."""
+    if param == "C50":
+        d50 = 1 / (1 + 10 ** (-value / 10))
+        eps = 1e-9
+        return (c50_from_d50(max(d50 - D50_JND, eps)), c50_from_d50(min(d50 + D50_JND, 1 - eps)))
+    if param in JND_ABS:
+        return value - JND_ABS[param], value + JND_ABS[param]
+    width = JND_REL.get(param, 0.05) * abs(value if relative_to is None else relative_to)
+    return value - width, value + width
 
 
 # =====================================================================
